@@ -169,13 +169,29 @@ if __name__ == "__main__":
 
 | 任务 | 状态 | 文件 |
 |------|------|------|
-| 训练脚本支持stop_at_epoch | ⏳ 待实现 | train_superclass.py |
-| 训练脚本保存特征 | ⏳ 待实现 | train_superclass.py |
-| 离线聚类脚本 | ✅ 已完成 | offline_ssddbc_superclass.py |
-| 训练脚本加载伪标签 | ⏳ 待实现 | train_superclass.py |
-| L_pseudo损失计算 | ⏳ 待实现 | train_superclass.py |
-| γ权重调度 | ⚠️ 已实现但未启用 | train_superclass.py |
-| 主调度脚本 | ⏳ 待实现 | orchestrator.py（新建） |
+| **阶段1**：离线伪标签生成闭环 | ✅ 已完成 | `scripts/offline_ssddbc_superclass.py`, `scripts/cache_features.py`, `utils/pseudo_labels.py` |
+| **阶段2**：训练端消费伪标签 | ✅ 已完成 | `scripts/train_superclass.py`, `utils/pseudo_labels.py` |
+| **阶段3**：伪标签损失与 γ 调度 | ✅ 已完成 | `scripts/train_superclass.py` |
+| **阶段4**：调度脚本自动化 | 🟡 进行中 | `scripts/pseudo_pipeline.py` | 基础 orchestrator 已实现 1→2→(2↔3)* 循环；后续需验证日志拼接与全流程。 |
+| 训练脚本支持 stop_at_epoch / 保存特征 | ✅ 已完成 | `scripts/train_superclass.py`, `scripts/_feature_cache_runner.py` |
+| 主调度脚本验证 | ⏳ 待验证 | `scripts/pseudo_pipeline.py` | 需要实际运行 pipeline 确认日志、ckpt、伪标签输出正确。 |
+
+### 运行中间产物存放与复用关系
+
+1. **阶段1（训练进程）**
+   - 生成 ckpt：`<exp_root>/checkpoints/<superclass>/ckpt_epoch_XXX.pt`（供 Stage2/Stage3 使用）；
+   - 写入 TensorBoard：`<exp_root>/superclass_train/log/(timestamp)/`（Stage3 通过 `--reuse_log_dir` 复用）；
+   - 若启用 `--save_features_and_exit`，自动运行 `scripts/cache_features.py` 在 `<feature_cache_dir>/<superclass>/features.pkl` 写入最新特征；Stage2 读取该缓存。
+2. **阶段2（离线 SSDDBC）**
+   - 读取 Stage1 的 feature cache；
+   - 输出伪标签 `.npz`：默认路径 `feature_cache_dir/<superclass>/pseudo_labels/*.npz` 或 orchestrator 指定的 `runs/<superclass>/<run_id>/pseudo_labels`；Stage3 用 `--pseudo_labels_path` 读取。
+3. **阶段3（伪标签续训）**
+   - `--resume_from_ckpt` 指向 Stage1 保存的 ckpt；
+   - `--pseudo_labels_path` 指向 Stage2 输出的 `.npz`；
+   - `--reuse_log_dir` 复用 Stage1 的日志目录，TensorBoard 曲线连续呈现。
+4. **orchestrator (`scripts/pseudo_pipeline.py`)**
+   - 创建统一的 `runs_root/<superclass>/<run_id>/`，将 `exp_root` 指向该目录；
+   - 指定 Stage1/Stage3 的 log/ckpt/pseudo 输出都落在同一 run 下，便于后续查验。
 
 ---
 

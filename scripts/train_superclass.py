@@ -12,6 +12,7 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from sklearn.cluster import KMeans
 import torch
@@ -30,7 +31,7 @@ from copy import deepcopy
 from tqdm import tqdm
 
 from project_utils.cluster_and_log_utils import log_accs_from_preds
-from config import exp_root, dino_pretrain_path
+from config import exp_root, dino_pretrain_path, feature_cache_dir
 
 # 从原始训练脚本导入必要的类和函数
 from methods.contrastive_training.contrastive_training import (
@@ -44,6 +45,7 @@ from utils.pseudo_labels import load_pseudo_label_cache
 
 # 导入超类模型保存器
 from project_utils.superclass_model_saver import create_superclass_model_saver
+from scripts._feature_cache_runner import run_cache_features
 from ssddbc.grid_search.api import run_clustering_search_on_features
 
 # TODO: Debug
@@ -70,7 +72,7 @@ def get_gamma(epoch: int, warmup_epochs: int = 50, total_epochs: int = 200) -> f
 
 
 def train_superclass(projection_head, model, train_loader, test_loader, unlabelled_train_loader, args,
-                     pseudo_cache=None, model_saver=None, progress_parent=None):
+                     pseudo_cache=None, model_saver=None, progress_parent=None, feature_cache_args=None):
     """
     超类训练函数，基于原始的train函数修改
 
@@ -466,11 +468,16 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
                 extra_state=extra_state,
             )
 
-        # 检查早停
-        if should_stop:
+        stop_at_epoch = getattr(args, "stop_at_epoch", None)
+        reached_stop = stop_at_epoch is not None and (epoch + 1) >= stop_at_epoch
+
+        if should_stop or reached_stop:
             if not is_grid_search:
-                print(f"\n🛑 超类 '{args.superclass_name}' 早停触发，在第{epoch+1}轮停止训练")
+                reason = "早停触发" if should_stop else f"到达 stop_at_epoch={stop_at_epoch}"
+                print(f"\n🛑 超类 '{args.superclass_name}' {reason}，在第{epoch+1}轮停止训练")
             training_session.finish_training(epoch, early_stopped=True)
+            if reached_stop and feature_cache_args and getattr(args, "save_features_and_exit", False):
+                _run_feature_cache_stage(args, feature_cache_args)
             break
 
     else:
@@ -494,6 +501,30 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
             print("   未保存任何最佳模型 (可能未达到保存条件)")
 
     return model, projection_head, best_test_acc_lab
+
+def _run_feature_cache_stage(args, feature_cache_args):
+    ckpt_dir = os.path.join(args.exp_root, "checkpoints", args.superclass_name)
+    latest_ckpt = None
+    if os.path.isdir(ckpt_dir):
+        candidates = sorted(
+            [os.path.join(ckpt_dir, f) for f in os.listdir(ckpt_dir) if f.startswith("ckpt_epoch_")],
+            reverse=True)
+        if candidates:
+            latest_ckpt = candidates[0]
+    if not latest_ckpt:
+        raise FileNotFoundError(f"在 {ckpt_dir} 找不到 ckpt_epoch_*.pt，无法导出特征")
+
+    run_cache_features(
+        superclass_name=feature_cache_args["superclass_name"],
+        model_path=latest_ckpt,
+        cache_dir=feature_cache_args["cache_dir"],
+        batch_size=feature_cache_args["batch_size"],
+        num_workers=feature_cache_args["num_workers"],
+        gpu=feature_cache_args["gpu"],
+        prop_train_labels=feature_cache_args["prop_train_labels"],
+        seed=feature_cache_args["seed"],
+    )
+
 
 def test_kmeans_superclass(model, test_loader, epoch, save_name, args):
     """
@@ -780,7 +811,16 @@ def train_single_superclass(args, model_saver=None, progress_parent=None):
         args,
         pseudo_cache=pseudo_cache,
         model_saver=model_saver,
-        progress_parent=progress_parent
+        progress_parent=progress_parent,
+        feature_cache_args={
+            "superclass_name": args.superclass_name,
+            "cache_dir": getattr(args, "feature_cache_dir_override", feature_cache_dir),
+            "batch_size": args.batch_size,
+            "num_workers": args.num_workers,
+            "gpu": args.gpu,
+            "prop_train_labels": args.prop_train_labels,
+            "seed": args.seed,
+        } if getattr(args, "save_features_and_exit", False) else None,
     )
 
 
@@ -861,6 +901,12 @@ def build_superclass_train_parser(add_help=True):
                         help='可选：每隔多少个epoch保存一次完整训练检查点（0表示不自动保存）。')
     parser.add_argument('--pseudo_labels_path', type=str, default=None,
                         help='可选：离线 SSDDBC 生成的伪标签文件(.npz)路径。提供后训练会加载伪标签进行阶段2/3实验。')
+    parser.add_argument('--reuse_log_dir', type=str, default=None,
+                        help='可选：复用既有 TensorBoard 日志目录，便于在多阶段训练中拼接曲线。')
+    parser.add_argument('--stop_at_epoch', type=int, default=None,
+                        help='可选：在指定 epoch 后提前停止训练，常用于阶段1预热。')
+    parser.add_argument('--save_features_and_exit', action='store_true',
+                        help='可选：在 stop_at_epoch 停止时自动触发特征缓存脚本。')
 
     # =====================================================================
     # 对比学习框架参数
@@ -917,10 +963,28 @@ def main():
         args.num_labeled_classes = len(args.train_classes)
         args.num_unlabeled_classes = len(args.unlabeled_classes)
 
-        # 初始化实验
+        # 初始化实验 / 复用日志
         exp_name = f'superclass_{args.superclass_name}_{args.model_name}'
         args.exp_name = exp_name
-        init_experiment(args, runner_name=['superclass_train'])
+        reuse_log_dir = getattr(args, "reuse_log_dir", None)
+        if reuse_log_dir:
+            reuse_log_dir = os.path.abspath(reuse_log_dir)
+            if not os.path.isdir(reuse_log_dir):
+                raise FileNotFoundError(f"reuse_log_dir 不存在: {reuse_log_dir}")
+            args.log_dir = reuse_log_dir
+            args.model_dir = os.path.join(args.log_dir, 'checkpoints')
+            os.makedirs(args.model_dir, exist_ok=True)
+            args.model_path = os.path.join(args.model_dir, 'model.pt')
+            if getattr(args, "writer", None):
+                try:
+                    args.writer.close()
+                except Exception:
+                    pass
+            args.writer = SummaryWriter(log_dir=args.log_dir)
+            if not getattr(args, 'is_grid_search', False):
+                print(f"🔁 复用 TensorBoard 日志目录: {args.log_dir}")
+        else:
+            init_experiment(args, runner_name=['superclass_train'])
         print(f'Using evaluation function {args.eval_funcs[0]} to print results')
 
         # 训练

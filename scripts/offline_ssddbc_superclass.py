@@ -26,6 +26,10 @@ from typing import Dict, Any
 
 import numpy as np
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
 from config import feature_cache_dir as DEFAULT_FEATURE_CACHE_DIR
 from utils.data.feature_loader import FeatureLoader
 from utils.pseudo_labels import save_pseudo_labels
