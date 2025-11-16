@@ -150,10 +150,10 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         training_session.start_epoch(epoch)
 
         loss_record = AverageMeter()
-    contrastive_loss_record = AverageMeter()
-    sup_con_loss_record = AverageMeter()
-    pseudo_loss_record = AverageMeter()
-    pseudo_core_record = AverageMeter()
+        contrastive_loss_record = AverageMeter()
+        sup_con_loss_record = AverageMeter()
+        pseudo_loss_record = AverageMeter()
+        pseudo_core_record = AverageMeter()
         train_acc_record = AverageMeter()
 
         # 定义轮次级别的权重变量，避免批次内重复定义

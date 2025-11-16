@@ -210,7 +210,7 @@ def run_offline_clustering(args: argparse.Namespace) -> str:
         k_range=range(args.k_min, args.k_max),
         density_range=range(args.density_min, args.density_max, args.density_step),
         random_state=0,
-        silent=False,
+        silent=True,
     )
 
     core_mask = np.zeros_like(indices, dtype=bool)
