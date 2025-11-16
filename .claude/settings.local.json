@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(route print:*)",
+      "Bash(route add:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(tasklist:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(tree:*)",
+      "Bash(python -c:*)",
+      "Bash(python3:*)",
+      "Bash(dir /s /b)",
+      "Bash(nul)",
+      "Bash(dir /b)",
+      "Bash(find:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
