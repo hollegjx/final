@@ -46,7 +46,6 @@ from utils.pseudo_labels import load_pseudo_label_cache
 # 导入超类模型保存器
 from project_utils.superclass_model_saver import create_superclass_model_saver
 from scripts._feature_cache_runner import run_cache_features
-from ssddbc.grid_search.api import run_clustering_search_on_features
 
 # TODO: Debug
 import warnings
@@ -95,7 +94,7 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
     is_grid_search = getattr(args, 'is_grid_search', False)
 
     # 初始化训练会话管理器
-    training_session = TrainingSession(args, enable_early_stopping=True, patience=20, quiet=is_grid_search)
+    training_session = TrainingSession(args, enable_early_stopping=False, patience=20, quiet=is_grid_search)
     model_info = {
         'name': args.base_model,
         'feat_dim': getattr(args, 'feat_dim', 'Unknown')
@@ -133,8 +132,19 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
             training_session=training_session,
         )
         start_epoch = loaded_epoch + 1
+
+        # 验证 T_max 是否一致（防止用户手动修改 --epochs 参数）
+        saved_T_max = extra_state.get("T_max")
+        if saved_T_max is not None and saved_T_max != args.epochs:
+            raise ValueError(
+                f"❌ Checkpoint 保存时的 epochs={saved_T_max}，"
+                f"但当前 --epochs={args.epochs}，T_max 不一致！\n"
+                f"提示：请使用相同的 --epochs 参数恢复训练，或删除 --resume_from_ckpt 参数从头训练。"
+            )
+
         if not is_grid_search:
-            print(f"   恢复到第 {start_epoch} 轮继续训练")
+            print(f"   ✅ 恢复到第 {start_epoch} 轮继续训练")
+            print(f"   ✅ Scheduler 状态已恢复 (T_max={args.epochs}, 学习率连续)")
 
     if pseudo_cache and getattr(args, "writer", None):
         args.writer.add_scalar('Pseudo/file_core_ratio', pseudo_cache.core_ratio, start_epoch)
@@ -320,96 +330,7 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         if not is_grid_search:
             print(f"   伪标签权重 γ(epoch={epoch}) = {gamma:.4f}")
 
-        # 3) 伪标签刷新钩子（阶段2：实际运行内存级聚类搜索，但尚未加入损失）
-        #    这里每隔10轮（从第50轮开始）在当前模型特征上执行一次网格搜索，
-        #    仅用于日志与评估，不修改训练过程或损失函数。
-        if epoch >= 50 and (epoch - 50) % 10 == 0:
-            if not is_grid_search:
-                print("   [PSEUDO] 刷新伪标签（仅聚类搜索和日志，不参与当前轮损失计算）...")
-
-            # 收集当前模型在训练集上的特征与标签（无梯度）
-            all_feats = []
-            all_targets = []
-            all_known = []
-            all_labeled = []
-
-            # 暂存当前模式
-            prev_model_training = model.training
-            prev_head_training = projection_head.training
-
-            model.eval()
-            projection_head.eval()
-
-            with torch.no_grad():
-                for batch in train_loader:
-                    images, class_labels, uq_idxs, mask_lab = batch
-                    # mask_lab: [B, 1] -> [B]
-                    mask_lab = mask_lab[:, 0].bool()
-
-                    class_labels = class_labels.to(args.device)
-                    # ContrastiveLearningViewGenerator 产生的两视图在 images 列表中
-                    images_cat = torch.cat(images, dim=0).to(args.device)  # (2B, C, H, W)
-
-                    feats = model(images_cat)
-                    feats = projection_head(feats)
-                    feats = torch.nn.functional.normalize(feats, dim=-1)
-
-                    # 仅使用第一视图的特征进行聚类搜索，保证与 class_labels/mask_lab 一一对应
-                    try:
-                        view1_feats, _ = feats.chunk(2, dim=0)  # (B, feat_dim)
-                    except RuntimeError:
-                        # 极少情况下 batch 尺寸不匹配时跳过该 batch
-                        continue
-
-                    all_feats.append(view1_feats.cpu().numpy())
-                    all_targets.append(class_labels.cpu().numpy())
-                    # 在当前实现中，将有标签样本视为已知类
-                    all_known.append(mask_lab.cpu().numpy())
-                    all_labeled.append(mask_lab.cpu().numpy())
-
-            # 恢复训练/评估模式
-            model.train(prev_model_training)
-            projection_head.train(prev_head_training)
-
-            features_np = np.concatenate(all_feats, axis=0)
-            targets_np = np.concatenate(all_targets, axis=0)
-            known_np = np.concatenate(all_known, axis=0)
-            labeled_np = np.concatenate(all_labeled, axis=0)
-
-            # 选择较小的搜索网格，避免在训练中引入过大开销
-            k_range = range(3, 8)               # k = 3,4,5,6,7
-            density_range = range(40, 80, 10)   # dp = 40,50,60,70
-
-            pseudo_result = run_clustering_search_on_features(
-                features=features_np,
-                targets=targets_np,
-                known_mask=known_np,
-                labeled_mask=labeled_np,
-                k_range=k_range,
-                density_range=density_range,
-                random_state=0,
-                silent=True,
-            )
-
-            core_ratio = (
-                len(pseudo_result.core_points) / len(pseudo_result.labels)
-                if len(pseudo_result.labels) > 0
-                else 0.0
-            )
-
-            if not is_grid_search:
-                print(
-                    f"   [PSEUDO] 聚类搜索完成: best_params={pseudo_result.best_params}, "
-                    f"All={pseudo_result.all_acc:.4f}, Old={pseudo_result.old_acc:.4f}, "
-                    f"New={pseudo_result.new_acc:.4f}, "
-                    f"core={len(pseudo_result.core_points)} ({core_ratio*100:.1f}%)"
-                )
-
-            # 将伪标签搜索的指标写入 TensorBoard，便于后续分析
-            args.writer.add_scalar('Pseudo/all_acc', pseudo_result.all_acc, epoch)
-            args.writer.add_scalar('Pseudo/old_acc', pseudo_result.old_acc, epoch)
-            args.writer.add_scalar('Pseudo/new_acc', pseudo_result.new_acc, epoch)
-            args.writer.add_scalar('Pseudo/core_ratio', core_ratio, epoch)
+        # 3) 伪标签刷新钩子（已由离线 Stage2 取代，避免在训练内部重复聚类）
 
         # 使用训练会话管理器处理轮次结束
         should_stop = training_session.end_epoch(
@@ -454,6 +375,7 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
             ckpt_path = os.path.join(ckpt_dir, ckpt_name)
             extra_state = {
                 "superclass_name": getattr(args, "superclass_name", None),
+                "T_max": args.epochs,  # 记录当前的 T_max，用于恢复时验证
             }
             if not is_grid_search:
                 print(f"💾 保存训练检查点: {ckpt_path}")

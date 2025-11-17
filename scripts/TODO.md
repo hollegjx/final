@@ -12,7 +12,7 @@
     ↓
 [阶段1] 启动训练进程 → 训练到指定epoch → 保存ckpt+特征 → 进程退出
     ↓
-[阶段2] 启动聚类进程 → 加载特征 → 并行SSDDBC网格搜索 → 保存伪标签 → 进程退出
+[阶段2] 启动聚类进程 → 加载特征 → SSDDBC 网格搜索 → 保存伪标签 → 进程退出
     ↓
 [阶段3] 启动训练进程 → 加载ckpt+伪标签 → 继续训练 → 进程退出
 ```
@@ -25,133 +25,16 @@
 
 ---
 
-## 二、三阶段详细描述
+## 二、三阶段概述（简版）
 
-### 阶段1：预热训练 [Epoch 0-49]
+- **阶段1：预热训练**  
+  训练到 `stop_at_epoch`（如 50），保存完整 ckpt（含优化器/调度器状态）并导出特征缓存，日志写入统一 log_dir。
 
-**执行方式**：
-```bash
-python train.py --config config.yaml --stop_at_epoch 50 --save_features_and_exit
-```
+- **阶段2：离线聚类**  
+  读取最新特征缓存和 ckpt，执行 SSDDBC 网格搜索，输出标准 `.npz`（indices/labels/core_mask/best_params）。缺失伪标签时用对应 epoch 的 ckpt 重新聚类，已有则复用。
 
-**训练目标**：让特征空间达到"SSDDBC能找到高质量聚类"的状态
-
-**损失函数**：
-```python
-L_total = L_self_supervised + L_semi_supervised
-```
-- `L_self_supervised`：所有样本基于数据增强形成正对
-- `L_semi_supervised`：有标注样本（旧类）使用真实标签形成正对
-
-**结束时保存**：
-- Checkpoint文件（包含model、optimizer、scheduler状态）
-- 特征文件（用于后续聚类）
-
----
-
-### 阶段2：离线聚类（独立进程，可多进程并行）
-
-**执行方式**：
-```bash
-python offline_clustering.py \
-  --superclass aquatic_mammals \
-  --ckpt checkpoints/epoch_50.pth \
-  --workers 8 \
-  --output pseudo_labels/epoch_50.npz
-```
-
-**执行内容**：
-1. 加载阶段1保存的特征文件
-2. 多进程并行执行SSDDBC网格搜索（k_range × density_range）
-3. 根据评价指标选择最佳聚类结果
-4. 保存伪标签文件
-
-**输出文件格式**（.npz）：
-```python
-{
-    'indices': np.ndarray,       # 核心点样本索引 (N_core,)
-    'labels': np.ndarray,        # 核心点伪标签 (N_core,)
-    'core_mask': np.ndarray,     # 全体样本核心点掩码 (N_total,)
-    'best_params': dict,         # 最佳超参 {k, density_percentile}
-}
-```
-
----
-
-### 阶段3：伪标签引导训练 [Epoch 50-200]
-
-**执行方式**：
-```bash
-python train.py \
-  --config config.yaml \
-  --resume checkpoints/epoch_50.pth \
-  --pseudo_labels pseudo_labels/epoch_50.npz \
-  --epochs 200
-```
-
-**损失函数**：
-```python
-L_total = L_self_supervised + L_semi_supervised + γ(epoch) · L_pseudo
-```
-
-**L_pseudo计算**（仅对核心点）：
-```python
-# 方案A（主）：监督对比损失
-L_pseudo = SupConLoss(features[core_mask], pseudo_labels[core_mask])
-
-# 方案B（备选）：原型对比损失
-L_pseudo = PrototypicalConLoss(features[core_mask], pseudo_labels[core_mask])
-```
-
-**γ权重调度**（线性增长）：
-```python
-def get_gamma(epoch):
-    if epoch < 50:
-        return 0.0
-    return (epoch - 50) / 150  # 50→200: 0.0→1.0
-```
-
----
-
-## 三、主调度脚本实现（orchestrator.py）
-
-```python
-import subprocess
-import sys
-
-def run_stage1_training(config):
-    """阶段1: 训练到epoch 50"""
-    cmd = [sys.executable, "train.py",
-           "--config", config,
-           "--stop_at_epoch", "50",
-           "--save_features_and_exit"]
-    subprocess.run(cmd, check=True)
-
-def run_stage2_clustering(superclass, ckpt):
-    """阶段2: 离线聚类"""
-    cmd = [sys.executable, "offline_clustering.py",
-           "--superclass", superclass,
-           "--ckpt", ckpt,
-           "--workers", "8",
-           "--output", "pseudo_labels.npz"]
-    subprocess.run(cmd, check=True)
-
-def run_stage3_resume(config, ckpt, pseudo):
-    """阶段3: 加载伪标签继续训练"""
-    cmd = [sys.executable, "train.py",
-           "--config", config,
-           "--resume", ckpt,
-           "--pseudo_labels", pseudo,
-           "--epochs", "200"]
-    subprocess.run(cmd, check=True)
-
-if __name__ == "__main__":
-    run_stage1_training("config.yaml")
-    run_stage2_clustering("aquatic_mammals", "checkpoints/epoch_50.pth")
-    run_stage3_resume("config.yaml", "checkpoints/epoch_50.pth", "pseudo_labels.npz")
-```
-
----
+- **阶段3：伪标签续训**  
+  恢复 ckpt + 伪标签继续训练，损失 = `(1-sup_con_weight)*L_contrast + sup_con_weight*L_supcon + γ·L_pseudo`，γ 按全局 total_epochs 线性增长。Stage3 分段由 orchestrator 控制，用 `--stop_at_epoch` 截断。
 
 ## 四、关键设计点
 
@@ -172,7 +55,7 @@ if __name__ == "__main__":
 | **阶段1**：离线伪标签生成闭环 | ✅ 已完成 | `scripts/offline_ssddbc_superclass.py`, `scripts/cache_features.py`, `utils/pseudo_labels.py` |
 | **阶段2**：训练端消费伪标签 | ✅ 已完成 | `scripts/train_superclass.py`, `utils/pseudo_labels.py` |
 | **阶段3**：伪标签损失与 γ 调度 | ✅ 已完成 | `scripts/train_superclass.py` |
-| **阶段4**：调度脚本自动化 | 🟡 进行中 | `scripts/pseudo_pipeline.py` | 基础 orchestrator 已实现 1→2→(2↔3)* 循环；后续需验证日志拼接与全流程。 |
+| **阶段4**：调度脚本自动化 | 🟡 进行中 | `scripts/pseudo_pipeline.py` | orchestrator 已支持 1→2→(2↔3)* 循环、断点恢复、伪标签复用/缺失补齐；需继续实跑验证 |
 | 训练脚本支持 stop_at_epoch / 保存特征 | ✅ 已完成 | `scripts/train_superclass.py`, `scripts/_feature_cache_runner.py` |
 | 主调度脚本验证 | ⏳ 待验证 | `scripts/pseudo_pipeline.py` | 需要实际运行 pipeline 确认日志、ckpt、伪标签输出正确。 |
 
@@ -184,14 +67,14 @@ if __name__ == "__main__":
    - 若启用 `--save_features_and_exit`，自动运行 `scripts/cache_features.py` 在 `<feature_cache_dir>/<superclass>/features.pkl` 写入最新特征；Stage2 读取该缓存。
 2. **阶段2（离线 SSDDBC）**
    - 读取 Stage1 的 feature cache；
-   - 输出伪标签 `.npz`：默认路径 `feature_cache_dir/<superclass>/pseudo_labels/*.npz` 或 orchestrator 指定的 `runs/<superclass>/<run_id>/pseudo_labels`；Stage3 用 `--pseudo_labels_path` 读取。
+   - 输出伪标签 `.npz`：默认路径 `feature_cache_dir/<superclass>/pseudo_labels/*.npz` 或 orchestrator 指定的 `runs/<superclass>/<run_id>/pseudo_labels`；Stage3 用 `--pseudo_labels_path` 读取，缺失则用对应 epoch ckpt 重新聚类，已有则复用。
 3. **阶段3（伪标签续训）**
    - `--resume_from_ckpt` 指向 Stage1 保存的 ckpt；
    - `--pseudo_labels_path` 指向 Stage2 输出的 `.npz`；
    - `--reuse_log_dir` 复用 Stage1 的日志目录，TensorBoard 曲线连续呈现。
 4. **orchestrator (`scripts/pseudo_pipeline.py`)**
-   - 创建统一的 `runs_root/<superclass>/<run_id>/`，将 `exp_root` 指向该目录；
-   - 指定 Stage1/Stage3 的 log/ckpt/pseudo 输出都落在同一 run 下，便于后续查验。
+   - 创建统一的 `runs_root/<superclass>/<run_id>/`（可用 `--resume_run_dir` 断点续跑），将 `exp_root` 指向该目录；
+   - Stage1/Stage3 的 log/ckpt/pseudo 均落在同一 run 下，伪标签缺失时按刷新基点对应的 ckpt 重新聚类，已有则复用。
 
 ---
 

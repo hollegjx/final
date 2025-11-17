@@ -35,7 +35,7 @@ def run_stage1(args, run_dir: Path):
         PYTHON_EXEC,
         "scripts/train_superclass.py",
         "--superclass_name", args.superclass_name,
-        "--epochs", str(args.stage1_epochs),
+        "--epochs", str(args.total_epochs),
         "--stop_at_epoch", str(args.stage1_epochs),
         "--save_ckpt_every", str(args.stage1_epochs),
         "--save_features_and_exit",
@@ -46,9 +46,20 @@ def run_stage1(args, run_dir: Path):
         "--seed", str(args.seed),
         "--reuse_log_dir", str(log_dir),
         "--exp_root", str(run_dir),
+        # 🆕 超参数配置
+        "--lr", str(args.lr),
+        "--grad_from_block", str(args.grad_from_block),
+        "--sup_con_weight", str(args.sup_con_weight),
+        "--momentum", str(args.momentum),
+        "--weight_decay", str(args.weight_decay),
+        "--contrast_unlabel_only", args.contrast_unlabel_only,
+        "--temperature", str(args.temperature),
     ]
     _run(cmd)
-    latest_ckpt = sorted(ckpt_dir.glob("ckpt_epoch_*.pt"))[-1]
+    ckpts = sorted(ckpt_dir.glob("ckpt_epoch_*.pt"))
+    if not ckpts:
+        raise RuntimeError(f"Stage1 训练失败：未在 {ckpt_dir} 生成 checkpoint 文件")
+    latest_ckpt = ckpts[-1]
     return latest_ckpt, log_dir
 
 
@@ -64,7 +75,10 @@ def run_stage2(args, ckpt_path: Path, run_dir: Path):
         "--pseudo_output_dir", str(pseudo_dir),
     ]
     _run(cmd)
-    newest = sorted(pseudo_dir.glob("*.npz"))[-1]
+    npz_files = sorted(pseudo_dir.glob("*.npz"))
+    if not npz_files:
+        raise RuntimeError(f"Stage2 聚类失败：未在 {pseudo_dir} 生成伪标签文件")
+    newest = npz_files[-1]
     return newest
 
 
@@ -91,7 +105,6 @@ def run_stage3(args, ckpt_path: Path, pseudo_path: Path, log_dir: Path,
     epochs_to_train = max(end_epoch - start_epoch, 0)
     if epochs_to_train <= 0:
         return ckpt_path
-    target_epoch = end_epoch
     save_every = max(1, args.update_interval)
     cmd = [
         PYTHON_EXEC,
@@ -100,7 +113,8 @@ def run_stage3(args, ckpt_path: Path, pseudo_path: Path, log_dir: Path,
         "--resume_from_ckpt", str(ckpt_path),
         "--pseudo_labels_path", str(pseudo_path),
         "--reuse_log_dir", str(log_dir),
-        "--epochs", str(target_epoch),
+        "--epochs", str(args.total_epochs),
+        "--stop_at_epoch", str(end_epoch),  # 训练到 end_epoch-1，保持区间长度一致
         "--save_ckpt_every", str(save_every),
         "--batch_size", str(args.batch_size),
         "--num_workers", str(args.num_workers),
@@ -108,44 +122,112 @@ def run_stage3(args, ckpt_path: Path, pseudo_path: Path, log_dir: Path,
         "--prop_train_labels", str(args.prop_train_labels),
         "--seed", str(args.seed),
         "--exp_root", str(run_dir),
+        # 🆕 超参数配置
+        "--lr", str(args.lr),
+        "--grad_from_block", str(args.grad_from_block),
+        "--sup_con_weight", str(args.sup_con_weight),
+        "--momentum", str(args.momentum),
+        "--weight_decay", str(args.weight_decay),
+        "--contrast_unlabel_only", args.contrast_unlabel_only,
+        "--temperature", str(args.temperature),
     ]
     _run(cmd)
     ckpt_dir = run_dir / "checkpoints" / args.superclass_name
-    latest_ckpt = sorted(ckpt_dir.glob("ckpt_epoch_*.pt"))[-1]
+    ckpts = sorted(ckpt_dir.glob("ckpt_epoch_*.pt"))
+    if not ckpts:
+        raise RuntimeError(f"Stage3 训练失败：未在 {ckpt_dir} 生成 checkpoint 文件")
+    latest_ckpt = ckpts[-1]
     return latest_ckpt
 
 
 def main():
     parser = argparse.ArgumentParser(description="三阶段伪标签训练管线")
-    parser.add_argument("--superclass_name", required=True)
-    parser.add_argument("--stage1_epochs", type=int, default=50)
-    parser.add_argument("--update_interval", type=int, default=5)
-    parser.add_argument("--total_epochs", type=int, default=200)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--gpu", type=int, default=0)
-    parser.add_argument("--prop_train_labels", type=float, default=0.8)
-    parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--feature_cache_dir", type=str, default="/data/gjx/checkpoints/features1")
-    parser.add_argument("--runs_root", type=str, default="runs_pipeline")
+
+    # 基础配置
+    parser.add_argument("--superclass_name", required=True, help="超类名称")
+    parser.add_argument("--stage1_epochs", type=int, default=50, help="Stage1 预热训练轮数")
+    parser.add_argument("--update_interval", type=int, default=5, help="伪标签更新间隔（轮数）")
+    parser.add_argument("--total_epochs", type=int, default=200, help="总训练轮数")
+    parser.add_argument("--batch_size", type=int, default=128, help="批次大小")
+    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
+    parser.add_argument("--gpu", type=int, default=0, help="GPU 设备编号")
+    parser.add_argument("--prop_train_labels", type=float, default=0.8, help="已知类训练比例")
+    parser.add_argument("--seed", type=int, default=1, help="随机种子")
+    parser.add_argument("--feature_cache_dir", type=str, default="/data/gjx/checkpoints/features1",
+                        help="特征缓存目录")
+    parser.add_argument("--runs_root", type=str, default="runs_pipeline", help="Pipeline 输出根目录")
+    parser.add_argument("--resume_run_dir", type=str, default=None,
+                        help="从已有任务目录恢复（例如 /data/gjx/pipeline_runs/trees/<run_id>）")
+
+    # 🆕 训练超参数配置
+    parser.add_argument("--lr", type=float, default=0.1,
+                        help="初始学习率 (默认: 0.1)")
+    parser.add_argument("--grad_from_block", type=int, default=11,
+                        help="ViT 解冻起始 block，范围 0-11 (默认: 11，仅解冻最后一层)")
+    parser.add_argument("--sup_con_weight", type=float, default=0.5,
+                        help="监督对比损失权重，范围 0-1 (默认: 0.5)")
+    parser.add_argument("--momentum", type=float, default=0.9,
+                        help="SGD 动量系数 (默认: 0.9)")
+    parser.add_argument("--weight_decay", type=float, default=1e-4,
+                        help="权重衰减系数（L2正则化） (默认: 1e-4)")
+    parser.add_argument("--contrast_unlabel_only", type=str, default="False",
+                        help="是否仅对无标签样本计算对比损失 (默认: False)")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="对比学习温度系数 (默认: 1.0)")
+
     args = parser.parse_args()
 
-    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(args.runs_root) / args.superclass_name / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
+    # 初始化/恢复运行目录
+    # 恢复或初始化运行目录
+    if args.resume_run_dir:
+        run_dir = Path(args.resume_run_dir)
+        log_dir = run_dir / "log"
+        ckpt_dir = run_dir / "checkpoints" / args.superclass_name
+        if not ckpt_dir.exists():
+            raise FileNotFoundError(f"恢复失败：未找到 ckpt 目录 {ckpt_dir}")
+        ckpts = sorted(ckpt_dir.glob("ckpt_epoch_*.pt"))
+        if not ckpts:
+            raise FileNotFoundError(f"恢复失败：{ckpt_dir} 下没有 ckpt_epoch_*.pt")
+        ckpt_path = ckpts[-1]
+        current_epoch = int(ckpt_path.stem.split("_")[-1])
+        feature_cache_ready = False  # 恢复时需要重新生成特征缓存
+        print(f"🔁 从 {run_dir} 恢复: ckpt={ckpt_path.name}, current_epoch={current_epoch}")
+    else:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = Path(args.runs_root) / args.superclass_name / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"=== Stage1: 预热到 epoch {args.stage1_epochs} ===")
+        ckpt_path, log_dir = run_stage1(args, run_dir)
+        feature_cache_ready = True  # Stage1 已导出特征
+        current_epoch = args.stage1_epochs
 
-    print(f"=== Stage1: 预热到 epoch {args.stage1_epochs} ===")
-    ckpt_path, log_dir = run_stage1(args, run_dir)
-    feature_cache_ready = True  # Stage1 已导出特征
-    current_epoch = args.stage1_epochs
+    # 定义目录路径（确保在循环中可用）
+    ckpt_dir = run_dir / "checkpoints" / args.superclass_name
+    pseudo_dir = run_dir / "pseudo_labels"
 
     while current_epoch < args.total_epochs:
         if not feature_cache_ready:
             run_feature_cache_for_ckpt(args, ckpt_path)
             feature_cache_ready = True
-        print(f"=== Stage2: 离线聚类 (当前 epoch {current_epoch}) ===")
-        pseudo_path = run_stage2(args, ckpt_path, run_dir)
+
+        # 因为 checkpoint 只在更新点保存，current_epoch 一定是更新点
+        # 所以 pseudo_base_epoch = current_epoch，next_epoch = current_epoch + interval
+        print(f"=== Stage2: 离线聚类 (epoch {current_epoch}) ===")
+        pseudo_dir.mkdir(exist_ok=True)
+
+        # 查找对应 epoch 的伪标签
+        existing_pseudo = sorted(pseudo_dir.glob(f"*epoch_{current_epoch:03d}*.npz"))
+        if existing_pseudo:
+            pseudo_path = existing_pseudo[-1]
+            print(f"   ↪ 复用已有伪标签: {pseudo_path.name}")
+        else:
+            # 缺少伪标签，使用当前 checkpoint 重新聚类
+            print(f"   ⚠️  缺少伪标签，使用 {ckpt_path.name} 重新聚类")
+            pseudo_path = run_stage2(args, ckpt_path, run_dir)
+
+        # 计算下一个训练终点
         next_epoch = min(current_epoch + args.update_interval, args.total_epochs)
+
         print(f"=== Stage3: 伪标签续训 {current_epoch} -> {next_epoch} ===")
         ckpt_path = run_stage3(
             args,

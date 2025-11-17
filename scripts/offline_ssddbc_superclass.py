@@ -205,16 +205,25 @@ def run_offline_clustering(args: argparse.Namespace) -> str:
         print("⚠️  缓存缺少 all_indices 字段，将默认使用顺序索引。建议重新生成缓存。")
         indices = np.arange(features.shape[0], dtype=np.int64)
 
-    print("🚀 [Stage 2/2] 在缓存特征上执行 SSDDBC 网格搜索 (API)...")
+    # 显示搜索配置
+    k_range = range(args.k_min, args.k_max)
+    density_range = range(args.density_min, args.density_max, args.density_step)
+    n_configs = len(list(k_range)) * len(list(density_range))
+
+    mode_str = f"并行模式 (max_workers={args.max_workers})" if args.max_workers != 1 else "单进程模式"
+    print(f"🚀 [Stage 2/2] 在缓存特征上执行 SSDDBC 网格搜索 ({mode_str})...")
+    print(f"   搜索空间: k={list(k_range)}, density={list(density_range)} (共 {n_configs} 个配置)")
+
     search_result = run_clustering_search_on_features(
         features=features,
         targets=targets,
         known_mask=known_mask,
         labeled_mask=labeled_mask,
-        k_range=range(args.k_min, args.k_max),
-        density_range=range(args.density_min, args.density_max, args.density_step),
+        k_range=k_range,
+        density_range=density_range,
         random_state=0,
         silent=True,
+        max_workers=args.max_workers,
     )
 
     core_mask = np.zeros_like(indices, dtype=bool)

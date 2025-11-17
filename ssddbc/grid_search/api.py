@@ -6,6 +6,7 @@
 用途：
 - 供训练代码直接在内存特征上执行聚类搜索，获取伪标签和核心点
 - 不做任何文件读写，也不依赖超类名称或特征缓存路径
+- 支持多进程并行搜索（使用 ProcessPoolExecutor）
 
 当前实现：
 - 固定使用已裁剪配置：
@@ -13,12 +14,15 @@
   use_cluster_quality=False（仅用 ACC 作为评分），
   cluster_distance_method='prototype'
 - 使用 split_cluster_acc_v2(all/old/new) 作为评分标准
+- 并行模式：max_workers 控制进程数，1 为单进程，None 为自动检测 CPU 核心数
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Sequence, Tuple
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 
 import numpy as np
 
@@ -46,6 +50,44 @@ def _to_numpy_1d(x: Sequence[int] | np.ndarray) -> np.ndarray:
     return arr
 
 
+def _worker_evaluate_config(
+    k: int,
+    dp: int,
+    X: np.ndarray,
+    targets: np.ndarray,
+    known_mask: np.ndarray,
+    labeled_mask: np.ndarray,
+    random_state: int,
+    silent: bool,
+) -> Tuple[float, int, int, np.ndarray, int, Sequence[int], Sequence[set[int]]]:
+    """
+    顶层 worker 函数：评估单个 (k, density_percentile) 配置
+
+    必须在模块级别定义以支持 pickle 序列化
+
+    Returns:
+        (all_acc, k, dp, predictions, n_clusters, unknown_clusters, core_clusters)
+    """
+    predictions, n_clusters, unknown_clusters, core_clusters = _run_single_configuration(
+        X=X,
+        targets=targets,
+        known_mask=known_mask,
+        labeled_mask=labeled_mask,
+        k=k,
+        density_percentile=dp,
+        random_state=random_state,
+        silent=silent,
+    )
+
+    all_acc, _, _ = split_cluster_acc_v2(
+        targets,
+        predictions,
+        known_mask,
+    )
+
+    return (all_acc, k, dp, predictions, n_clusters, unknown_clusters, core_clusters)
+
+
 def run_clustering_search_on_features(
     features: np.ndarray,
     targets: Sequence[int],
@@ -56,6 +98,7 @@ def run_clustering_search_on_features(
     density_range: Iterable[int],
     random_state: int = 0,
     silent: bool = True,
+    max_workers: Optional[int] = None,
 ) -> ClusteringSearchResult:
     """
     在内存特征上执行 SS-DDBC 网格搜索（不涉及磁盘 I/O）
@@ -69,6 +112,7 @@ def run_clustering_search_on_features(
         density_range: 密度百分位搜索范围，例如 range(40, 100, 5)
         random_state: 随机种子
         silent: 是否静默模式
+        max_workers: 最大并行工作进程数。None 表示使用 CPU 核心数，1 表示单进程模式
 
     Returns:
         ClusteringSearchResult
@@ -93,13 +137,25 @@ def run_clustering_search_on_features(
             f"{known_mask_np.shape[0]}, {labeled_mask_np.shape[0]}"
         )
 
+    # 决定工作进程数
+    if max_workers is None:
+        max_workers = mp.cpu_count()
+
+    # 生成所有配置组合
+    k_list = list(k_range)
+    dp_list = list(density_range)
+    configs = [(k, dp) for k in k_list for dp in dp_list]
+
+    if not configs:
+        raise ValueError("k_range 和 density_range 不能为空")
+
     best_score = -1.0
     best_result: Optional[Tuple[np.ndarray, int, Sequence[int], Sequence[set[int]]]] = None
     best_params: Dict[str, int] = {}
 
-    for k in k_range:
-        for dp in density_range:
-            # 运行一次 SS-DDBC 聚类（使用裁剪后的固定配置）
+    # 单进程模式：保持原有串行逻辑
+    if max_workers == 1:
+        for k, dp in configs:
             predictions, n_clusters, unknown_clusters, core_clusters = _run_single_configuration(
                 X=X,
                 targets=targets_np,
@@ -111,7 +167,6 @@ def run_clustering_search_on_features(
                 silent=silent,
             )
 
-            # 基于 v2 ACC 评分（与 test_superclass 保持一致）
             all_acc, old_acc, new_acc = split_cluster_acc_v2(
                 targets_np,
                 predictions,
@@ -122,6 +177,27 @@ def run_clustering_search_on_features(
                 best_score = all_acc
                 best_result = (predictions, n_clusters, unknown_clusters, core_clusters)
                 best_params = {"k": k, "density_percentile": dp}
+
+    # 多进程模式：并行评估所有配置
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # 提交所有任务
+            futures = [
+                executor.submit(
+                    _worker_evaluate_config,
+                    k, dp, X, targets_np, known_mask_np, labeled_mask_np, random_state, silent
+                )
+                for k, dp in configs
+            ]
+
+            # 收集结果并找到最佳配置
+            for future in futures:
+                all_acc, k, dp, predictions, n_clusters, unknown_clusters, core_clusters = future.result()
+
+                if all_acc > best_score:
+                    best_score = all_acc
+                    best_result = (predictions, n_clusters, unknown_clusters, core_clusters)
+                    best_params = {"k": k, "density_percentile": dp}
 
     if best_result is None:
         raise RuntimeError("聚类搜索未产生任何结果，请检查 k_range / density_range 是否为空。")
