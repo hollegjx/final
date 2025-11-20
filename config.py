@@ -19,7 +19,7 @@ import os
 # 服务器路径前缀
 # =============================================================================
 
-SERVER_BASE_PATH = os.getenv('SERVER_BASE_PATH', '/data/gjx')
+SERVER_BASE_PATH = os.getenv('SERVER_BASE_PATH', '/data1/jiangzhen/gjx')
 
 
 # =============================================================================

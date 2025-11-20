@@ -40,7 +40,15 @@ class SuperclassModelSaver:
         """
         self.superclass_name = superclass_name
         self.args = args  # 保存训练参数引用
-        self.save_dir = os.path.join(superclass_model_root, superclass_name)
+
+        # 优先使用 args.exp_root（pipeline 模式），否则使用全局路径
+        if args is not None and hasattr(args, 'exp_root'):
+            # Pipeline 模式：使用带时间戳的运行目录
+            self.save_dir = os.path.join(args.exp_root, 'checkpoints', superclass_name)
+        else:
+            # 独立训练模式：使用全局路径
+            self.save_dir = os.path.join(superclass_model_root, superclass_name)
+
         self.best_acc = -1.0
         self.current_best_model_path = None
         self.current_best_proj_path = None

@@ -11,23 +11,26 @@
 当前实现：
 - 固定使用已裁剪配置：
   dense_method=1, co_mode=2, assign_model=3,
-  use_cluster_quality=False（仅用 ACC 作为评分），
   cluster_distance_method='prototype'
-- 使用 split_cluster_acc_v2(all/old/new) 作为评分标准
+- 使用损失函数（L1 + L2）作为评分标准，权重：
+  * l1_weight=1.0
+  * separation_weight=0.0
+  * silhouette_weight=3.0
 - 并行模式：max_workers 控制进程数，1 为单进程，None 为自动检测 CPU 核心数
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Sequence, Tuple
-from concurrent.futures import ProcessPoolExecutor
+from typing import Dict, Iterable, Optional, Sequence, Tuple, Union
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 
 import numpy as np
+from tqdm import tqdm
 
 from ssddbc.ssddbc.adaptive_clustering import adaptive_density_clustering
-from project_utils.cluster_and_log_utils import split_cluster_acc_v2
+from ssddbc.evaluation.loss_function import compute_total_loss
 
 
 @dataclass
@@ -37,10 +40,9 @@ class ClusteringSearchResult:
     labels: np.ndarray
     core_points: np.ndarray
     best_params: Dict[str, int]
-    all_acc: float
-    old_acc: float
-    new_acc: float
+    loss: float  # 实际是评分函数值，越大越好
     n_clusters: int
+    densities: Optional[np.ndarray] = None
 
 
 def _to_numpy_1d(x: Sequence[int] | np.ndarray) -> np.ndarray:
@@ -66,7 +68,8 @@ def _worker_evaluate_config(
     必须在模块级别定义以支持 pickle 序列化
 
     Returns:
-        (all_acc, k, dp, predictions, n_clusters, unknown_clusters, core_clusters)
+        (score, k, dp, predictions, n_clusters, unknown_clusters, core_clusters)
+        注：score 越大越好
     """
     predictions, n_clusters, unknown_clusters, core_clusters = _run_single_configuration(
         X=X,
@@ -79,13 +82,27 @@ def _worker_evaluate_config(
         silent=silent,
     )
 
-    all_acc, _, _ = split_cluster_acc_v2(
-        targets,
-        predictions,
-        known_mask,
+    # 计算损失函数（L1 + L2）
+    loss_dict = compute_total_loss(
+        X=X,
+        predictions=predictions,
+        targets=targets,
+        labeled_mask=labeled_mask,
+        l1_weight=1.0,
+        l2_weight=1.0,
+        l1_type='cross_entropy',
+        l2_components=['separation', 'silhouette'],
+        l2_component_weights={'silhouette': 3.0},
+        separation_weight=0.0,
+        clusters=core_clusters,
+        k=k,
+        cluster_distance_method='prototype',
+        silent=True,
     )
 
-    return (all_acc, k, dp, predictions, n_clusters, unknown_clusters, core_clusters)
+    total_loss = loss_dict['total_loss']
+
+    return (total_loss, k, dp, predictions, n_clusters, unknown_clusters, core_clusters)
 
 
 def run_clustering_search_on_features(
@@ -102,6 +119,10 @@ def run_clustering_search_on_features(
 ) -> ClusteringSearchResult:
     """
     在内存特征上执行 SS-DDBC 网格搜索（不涉及磁盘 I/O）
+
+    使用损失函数（L1 + L2）评价参数组合，选择最大分数的配置。
+    注：由于L2包含maximize组件，实际是找最大值而非最小损失。
+    权重配置：l1_weight=1.0, separation_weight=0.0, silhouette_weight=3.0
 
     Args:
         features: 特征矩阵 (n_samples, feat_dim)
@@ -149,9 +170,19 @@ def run_clustering_search_on_features(
     if not configs:
         raise ValueError("k_range 和 density_range 不能为空")
 
-    best_score = -1.0
+    best_score = float('-inf')  # 找最大分数（因为L2组件是maximize）
     best_result: Optional[Tuple[np.ndarray, int, Sequence[int], Sequence[set[int]]]] = None
     best_params: Dict[str, int] = {}
+
+    # 创建进度条（始终显示，即使在 silent 模式下）
+    pbar = tqdm(
+        total=len(configs),
+        desc="Grid search",
+        unit="config",
+        ncols=100,
+        leave=True,
+        disable=False,  # 始终显示进度条
+    )
 
     # 单进程模式：保持原有串行逻辑
     if max_workers == 1:
@@ -167,42 +198,82 @@ def run_clustering_search_on_features(
                 silent=silent,
             )
 
-            all_acc, old_acc, new_acc = split_cluster_acc_v2(
-                targets_np,
-                predictions,
-                known_mask_np,
+            # 计算损失函数
+            loss_dict = compute_total_loss(
+                X=X,
+                predictions=predictions,
+                targets=targets_np,
+                labeled_mask=labeled_mask_np,
+                l1_weight=1.0,
+                l2_weight=1.0,
+                l1_type='cross_entropy',
+                l2_components=['separation', 'silhouette'],
+                l2_component_weights={'silhouette': 3.0},
+                separation_weight=0.0,
+                clusters=core_clusters,
+                k=k,
+                cluster_distance_method='prototype',
+                silent=True,
             )
 
-            if all_acc > best_score:
-                best_score = all_acc
+            total_loss = loss_dict['total_loss']
+
+            if total_loss > best_score:
+                best_score = total_loss
                 best_result = (predictions, n_clusters, unknown_clusters, core_clusters)
                 best_params = {"k": k, "density_percentile": dp}
+
+            # 更新进度条
+            pbar.update(1)
+            pbar.set_postfix({"k": k, "dp": dp, "best": f"{best_score:.3f}"})
 
     # 多进程模式：并行评估所有配置
     else:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有任务
-            futures = [
+            future_to_params = {
                 executor.submit(
                     _worker_evaluate_config,
-                    k, dp, X, targets_np, known_mask_np, labeled_mask_np, random_state, silent
-                )
+                    k, dp, X, targets_np, known_mask_np, labeled_mask_np, random_state, silent,
+                ): (k, dp)
                 for k, dp in configs
-            ]
+            }
 
-            # 收集结果并找到最佳配置
-            for future in futures:
-                all_acc, k, dp, predictions, n_clusters, unknown_clusters, core_clusters = future.result()
+            # 收集结果并找到最佳配置（最大分数）
+            for future in as_completed(future_to_params):
+                total_loss, k, dp, predictions, n_clusters, unknown_clusters, core_clusters = future.result()
 
-                if all_acc > best_score:
-                    best_score = all_acc
+                if total_loss > best_score:
+                    best_score = total_loss
                     best_result = (predictions, n_clusters, unknown_clusters, core_clusters)
                     best_params = {"k": k, "density_percentile": dp}
+
+                # 更新进度条
+                pbar.update(1)
+                pbar.set_postfix({"k": k, "dp": dp, "best": f"{best_score:.3f}"})
+
+    # 关闭进度条
+    pbar.close()
 
     if best_result is None:
         raise RuntimeError("聚类搜索未产生任何结果，请检查 k_range / density_range 是否为空。")
 
     predictions, n_clusters, unknown_clusters, core_clusters = best_result
+
+    # 为最佳配置重新运行一次聚类以获取密度（减少并行模式下的跨进程序列化压力）
+    densities = None
+    if best_params:
+        predictions, n_clusters, unknown_clusters, core_clusters, densities = _run_single_configuration(
+            X=X,
+            targets=targets_np,
+            known_mask=known_mask_np,
+            labeled_mask=labeled_mask_np,
+            k=best_params["k"],
+            density_percentile=best_params["density_percentile"],
+            random_state=random_state,
+            silent=silent,
+            return_densities=True,
+        )
 
     # 核心点定义：使用 core_clusters 中的点集合
     core_indices: set[int] = set()
@@ -210,21 +281,13 @@ def run_clustering_search_on_features(
         core_indices.update(cluster)
     core_points = np.array(sorted(core_indices), dtype=int)
 
-    # 使用最佳配置重新计算 ACC（避免浮点误差累积）
-    all_acc, old_acc, new_acc = split_cluster_acc_v2(
-        targets_np,
-        predictions,
-        known_mask_np,
-    )
-
     return ClusteringSearchResult(
         labels=predictions,
         core_points=core_points,
         best_params=best_params,
-        all_acc=float(all_acc),
-        old_acc=float(old_acc),
-        new_acc=float(new_acc),
+        loss=float(best_score),
         n_clusters=int(n_clusters),
+        densities=densities,
     )
 
 
@@ -238,7 +301,11 @@ def _run_single_configuration(
     density_percentile: int,
     random_state: int,
     silent: bool,
-) -> Tuple[np.ndarray, int, Sequence[int], Sequence[set[int]]]:
+    return_densities: bool = False,
+) -> Union[
+    Tuple[np.ndarray, int, Sequence[int], Sequence[set[int]]],
+    Tuple[np.ndarray, int, Sequence[int], Sequence[set[int]], np.ndarray],
+]:
     """
     使用单组 (k, density_percentile) 配置运行一次 SS-DDBC 聚类。
 
@@ -248,7 +315,8 @@ def _run_single_configuration(
     # train_size: 这里视为所有样本都属于“训练集”（无显式train/test划分）
     train_size = X.shape[0]
 
-    predictions, n_clusters, unknown_clusters, _, _, _, _, core_clusters = adaptive_density_clustering(
+    (predictions, n_clusters, unknown_clusters, _, _, _, core_clusters,
+     densities) = adaptive_density_clustering(
         X,
         targets,
         known_mask,
@@ -261,12 +329,15 @@ def _run_single_configuration(
         co_manual=None,
         eval_dense=False,
         eval_version="v2",
-        silent=silent,
+        fast_mode=True,  # 网格搜索使用快速模式，跳过不必要计算
         dense_method=1,
         assign_model=3,
         voting_k=5,
         detail_dense=False,
         label_guide=False,
     )
+
+    if return_densities:
+        return predictions, n_clusters, unknown_clusters, core_clusters, densities
 
     return predictions, n_clusters, unknown_clusters, core_clusters

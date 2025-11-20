@@ -291,7 +291,7 @@ def run_parameter_grid_search(superclass_name, model_path, k_range=(3, 21),
                 k=k,
                 density_percentile=density_percentile,
                 eval_version=eval_version,
-                merge_clusters=merge_clusters,
+                fast_mode=True,  # 网格搜索使用快速模式
                 run_kmeans_baseline=True
             )
 

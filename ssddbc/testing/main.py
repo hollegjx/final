@@ -43,8 +43,8 @@ def main():
                         help='是否合并训练集和测试集进行聚类。True=合并(默认)，在更大数据集上构建更鲁棒的聚类；False=仅测试集，更快但可能不稳定')
     parser.add_argument('--l2', type=str2bool, default=True,
                         help='是否使用L2归一化特征，默认True。True=使用L2归一化(推荐，与eval_original_gcd保持一致)，False=使用原始特征(不推荐)')
-    parser.add_argument('--silent', type=str2bool, default=False,
-                        help='静默模式，默认False。True=关闭所有调试输出和分析，仅显示最终结果，用于网格搜索加速或批量实验')
+    parser.add_argument('--fast_mode', type=str2bool, default=False,
+                        help='快速模式，默认False。True=跳过不必要的计算（未知簇识别、簇类别标签）和调试输出，仅显示最终结果，用于网格搜索加速或批量实验；False=完整计算和输出')
 
     # ========== 2. 密度计算相关参数 ==========
     parser.add_argument('--k', type=int, default=10,
@@ -190,7 +190,7 @@ def main():
             run_kmeans_baseline=args.run_kmeans_baseline,  # 传递K-means基线参数
             use_l2=args.l2,
             eval_dense=args.eval_dense,
-            silent=args.silent,  # 传递静默模式参数
+            fast_mode=args.fast_mode,  # 传递快速模式参数
             dense_method=args.dense_method,  # 传递密度计算方法
             assign_model=args.assign_model,  # 传递稀疏点分配策略
             voting_k=args.voting_k,  # 传递KNN投票邻居数量

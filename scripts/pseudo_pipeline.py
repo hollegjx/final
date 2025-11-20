@@ -19,6 +19,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PYTHON_EXEC = sys.executable
 
+# 添加项目根目录到路径以导入工具模块
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.best_model_tracker import BestModelTracker
+from config import feature_cache_dir as DEFAULT_FEATURE_CACHE_DIR
+
 
 def _run(cmd, cwd=None):
     print("🚀 运行命令:")
@@ -29,8 +36,10 @@ def _run(cmd, cwd=None):
 def run_stage1(args, run_dir: Path):
     log_dir = run_dir / "log"
     ckpt_dir = run_dir / "checkpoints" / args.superclass_name
+    features_dir = run_dir / "features"
     log_dir.mkdir(parents=True, exist_ok=True)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    features_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         PYTHON_EXEC,
         "scripts/train_superclass.py",
@@ -39,6 +48,7 @@ def run_stage1(args, run_dir: Path):
         "--stop_at_epoch", str(args.stage1_epochs),
         "--save_ckpt_every", str(args.stage1_epochs),
         "--save_features_and_exit",
+        "--feature_cache_dir", str(features_dir),
         "--batch_size", str(args.batch_size),
         "--num_workers", str(args.num_workers),
         "--gpu", str(args.gpu),
@@ -65,14 +75,16 @@ def run_stage1(args, run_dir: Path):
 
 def run_stage2(args, ckpt_path: Path, run_dir: Path):
     pseudo_dir = run_dir / "pseudo_labels"
+    features_dir = run_dir / "features"
     pseudo_dir.mkdir(exist_ok=True)
     cmd = [
         PYTHON_EXEC,
         "scripts/offline_ssddbc_superclass.py",
         "--superclass_name", args.superclass_name,
         "--ckpt_path", str(ckpt_path),
-        "--feature_cache_dir", args.feature_cache_dir,
+        "--feature_cache_dir", str(features_dir),
         "--pseudo_output_dir", str(pseudo_dir),
+        "--skip_feature_extraction",  # 🆕 跳过特征提取，直接使用缓存
     ]
     _run(cmd)
     npz_files = sorted(pseudo_dir.glob("*.npz"))
@@ -82,14 +94,16 @@ def run_stage2(args, ckpt_path: Path, run_dir: Path):
     return newest
 
 
-def run_feature_cache_for_ckpt(args, ckpt_path: Path):
+def run_feature_cache_for_ckpt(args, ckpt_path: Path, run_dir: Path):
+    features_dir = run_dir / "features"
+    features_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
         PYTHON_EXEC,
         "scripts/cache_features.py",
         "--superclass_name", args.superclass_name,
         "--model_path", str(ckpt_path),
         "--auto_find_best", "False",
-        "--cache_dir", args.feature_cache_dir,
+        "--cache_dir", str(features_dir),
         "--batch_size", str(args.batch_size),
         "--num_workers", str(args.num_workers),
         "--gpu", str(args.gpu),
@@ -112,6 +126,9 @@ def run_stage3(args, ckpt_path: Path, pseudo_path: Path, log_dir: Path,
         "--superclass_name", args.superclass_name,
         "--resume_from_ckpt", str(ckpt_path),
         "--pseudo_labels_path", str(pseudo_path),
+        "--pseudo_weight_mode", args.pseudo_weight_mode,
+        "--pseudo_loss_weight", str(args.pseudo_loss_weight),
+        "--warmup_epochs", str(args.stage1_epochs),  # 🆕 使用 stage1_epochs 作为 warmup_epochs
         "--reuse_log_dir", str(log_dir),
         "--epochs", str(args.total_epochs),
         "--stop_at_epoch", str(end_epoch),  # 训练到 end_epoch-1，保持区间长度一致
@@ -141,23 +158,41 @@ def run_stage3(args, ckpt_path: Path, pseudo_path: Path, log_dir: Path,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="三阶段伪标签训练管线")
+    parser = argparse.ArgumentParser(
+        description="三阶段伪标签训练管线",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
 
     # 基础配置
-    parser.add_argument("--superclass_name", required=True, help="超类名称")
-    parser.add_argument("--stage1_epochs", type=int, default=50, help="Stage1 预热训练轮数")
-    parser.add_argument("--update_interval", type=int, default=5, help="伪标签更新间隔（轮数）")
-    parser.add_argument("--total_epochs", type=int, default=200, help="总训练轮数")
-    parser.add_argument("--batch_size", type=int, default=128, help="批次大小")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
-    parser.add_argument("--gpu", type=int, default=0, help="GPU 设备编号")
-    parser.add_argument("--prop_train_labels", type=float, default=0.8, help="已知类训练比例")
-    parser.add_argument("--seed", type=int, default=1, help="随机种子")
-    parser.add_argument("--feature_cache_dir", type=str, default="/data/gjx/checkpoints/features1",
-                        help="特征缓存目录")
-    parser.add_argument("--runs_root", type=str, default="runs_pipeline", help="Pipeline 输出根目录")
+    parser.add_argument("--superclass_name", required=True,
+                        help="要训练的超类名称（如 trees）")
+    parser.add_argument("--stage1_epochs", type=int, default=50,
+                        help="Stage1 预热训练轮数（无伪标签）")
+    parser.add_argument("--update_interval", type=int, default=5,
+                        help="伪标签更新间隔，每 N 轮重新聚类")
+    parser.add_argument("--total_epochs", type=int, default=200,
+                        help="总训练轮数（包含预热和续训）")
+    parser.add_argument("--batch_size", type=int, default=128,
+                        help="训练批次大小")
+    parser.add_argument("--num_workers", type=int, default=8,
+                        help="DataLoader 工作线程数")
+    parser.add_argument("--gpu", type=int, default=0,
+                        help="使用的 GPU 设备编号")
+    parser.add_argument("--prop_train_labels", type=float, default=0.8,
+                        help="已知类样本中用于训练的比例")
+    parser.add_argument("--seed", type=int, default=1,
+                        help="随机种子，用于保证实验可复现")
+    parser.add_argument("--feature_cache_dir", type=str, default=DEFAULT_FEATURE_CACHE_DIR,
+                        help="特征缓存根目录")
+    parser.add_argument("--runs_root", type=str, default="runs_pipeline",
+                        help="Pipeline 运行输出根目录")
     parser.add_argument("--resume_run_dir", type=str, default=None,
-                        help="从已有任务目录恢复（例如 /data/gjx/pipeline_runs/trees/<run_id>）")
+                        help="从已有任务目录恢复（支持断点续训）")
+    parser.add_argument("--pseudo_weight_mode", type=str, default="none",
+                        choices=["none", "density"],
+                        help="阶段3训练使用的伪标签加权模式")
+    parser.add_argument("--pseudo_loss_weight", type=float, default=1.0,
+                        help="伪标签损失的整体权重系数 λ，最终权重 = γ × λ（默认: 1.0）")
 
     # 🆕 训练超参数配置
     parser.add_argument("--lr", type=float, default=0.1,
@@ -207,7 +242,7 @@ def main():
 
     while current_epoch < args.total_epochs:
         if not feature_cache_ready:
-            run_feature_cache_for_ckpt(args, ckpt_path)
+            run_feature_cache_for_ckpt(args, ckpt_path, run_dir)
             feature_cache_ready = True
 
         # 因为 checkpoint 只在更新点保存，current_epoch 一定是更新点
@@ -243,6 +278,10 @@ def main():
         print(f"✅ 已完成到 epoch {current_epoch}")
 
     print(f"✅ pipeline 完成，运行目录: {run_dir}")
+
+    # 显示全局最佳模型信息
+    tracker = BestModelTracker(str(run_dir))
+    tracker.print_summary()
 
 
 if __name__ == "__main__":

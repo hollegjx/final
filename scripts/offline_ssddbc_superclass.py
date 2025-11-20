@@ -127,6 +127,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="伪标签输出目录（默认写入 feature_cache_dir/<superclass_name>/pseudo_labels）。",
     )
+    parser.add_argument(
+        "--skip_feature_extraction",
+        action="store_true",
+        help="跳过特征提取阶段，直接使用已有缓存（适用于 pipeline 场景）。",
+    )
 
     return parser
 
@@ -240,9 +245,7 @@ def run_offline_clustering(args: argparse.Namespace) -> str:
     metadata = _build_pseudo_metadata(
         args,
         {
-            "all_acc": search_result.all_acc,
-            "old_acc": search_result.old_acc,
-            "new_acc": search_result.new_acc,
+            "score": search_result.loss,  # 字段名保持loss，但实际是score（越大越好）
             "n_clusters": search_result.n_clusters,
             "num_core_points": int(core_mask.sum()),
         },
@@ -255,11 +258,12 @@ def run_offline_clustering(args: argparse.Namespace) -> str:
         core_mask=core_mask,
         best_params=search_result.best_params,
         metadata=metadata,
+        densities=search_result.densities,
     )
 
     print(
         f"✅ 伪标签已保存: {pseudo_path}\n"
-        f"   ACC(all/old/new) = {search_result.all_acc:.4f}/{search_result.old_acc:.4f}/{search_result.new_acc:.4f}\n"
+        f"   Score = {search_result.loss:.4f} (越大越好)\n"
         f"   核心点: {core_mask.sum()} / {len(core_mask)} | 最佳参数: {search_result.best_params}"
     )
     return pseudo_path
@@ -276,7 +280,22 @@ def main() -> None:
     if not os.path.isfile(args.ckpt_path):
         raise FileNotFoundError(f"找不到指定 ckpt 文件: {args.ckpt_path}")
 
-    run_cache_features(args)
+    # 条件性执行特征提取
+    if args.skip_feature_extraction:
+        print("⏭️  跳过特征提取阶段（使用已有缓存）")
+        # 验证缓存是否存在
+        from utils.data.feature_loader import FeatureLoader
+        loader = FeatureLoader(cache_base_dir=args.feature_cache_dir)
+        cache_path = loader.get_cache_path(args.superclass_name, use_l2=True)
+        if not os.path.isfile(cache_path):
+            raise FileNotFoundError(
+                f"❌ 缓存文件不存在: {cache_path}\n"
+                f"提示: 请先运行特征提取，或移除 --skip_feature_extraction 参数"
+            )
+        print(f"✅ 找到特征缓存: {cache_path}")
+    else:
+        run_cache_features(args)
+
     pseudo_path = run_offline_clustering(args)
 
     print("\n✅ 离线 SSDDBC 管线执行完成（提特征 + SSDDBC 网格搜索）。")

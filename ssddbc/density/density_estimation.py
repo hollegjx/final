@@ -10,7 +10,7 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
 
-def compute_median_density(X, k=10):
+def compute_median_density(X, k=10, silent=False):
     """
     使用k近邻中位数距离倒数计算密度（更鲁棒，对极值不敏感）
 
@@ -23,14 +23,13 @@ def compute_median_density(X, k=10):
     Args:
         X: 特征矩阵 (n_samples, feat_dim)
         k: k近邻数量
+        silent: 是否静默模式
 
     Returns:
         densities: 每个样本的密度值
         knn_distances: k近邻距离矩阵
         neighbors: k近邻索引矩阵
     """
-    print(f"[DENSITY] 计算中位数密度 (k={k})...")
-
     # 计算k近邻 (确保结果确定性)
     nbrs = NearestNeighbors(n_neighbors=k+1, metric='euclidean', algorithm='auto').fit(X)
     knn_distances, neighbors = nbrs.kneighbors(X)
@@ -55,8 +54,6 @@ def compute_median_density(X, k=10):
     # 中位数密度计算：k近邻中位数距离的倒数
     median_distances = np.median(knn_distances, axis=1)
     densities = 1.0 / (median_distances + 1e-8)  # 避免除零
-
-    print(f"   密度统计: min={densities.min():.3f}, max={densities.max():.3f}, mean={densities.mean():.3f}")
 
     return densities, knn_distances, neighbors
 
@@ -93,7 +90,7 @@ def analyze_knn_average_distances(knn_distances):
     return mean_d
 
 
-def identify_high_density_points(densities, percentile=75, use_relative=False):
+def identify_high_density_points(densities, percentile=75, use_relative=False, silent=False):
     """
     步骤2: 选择高密度点作为聚类种子（使用百分位数阈值）
 
@@ -101,6 +98,7 @@ def identify_high_density_points(densities, percentile=75, use_relative=False):
         densities: 密度值数组（可以是绝对密度或相对密度）
         percentile: 百分位数阈值
         use_relative: 是否使用相对密度（用于打印提示）
+        silent: 是否静默模式
 
     Returns:
         high_density_mask: 高密度点掩码
@@ -108,15 +106,10 @@ def identify_high_density_points(densities, percentile=75, use_relative=False):
     density_threshold = np.percentile(densities, percentile)
     high_density_mask = densities >= density_threshold
 
-    density_type = "相对密度" if use_relative else "绝对密度"
-    print(f"[HIGH-DENSITY] 识别高密度点 ({density_type}, 百分位数阈值):")
-    print(f"   密度阈值: {density_threshold:.3f} (第{percentile}百分位数)")
-    print(f"   高密度点数量: {np.sum(high_density_mask)} / {len(densities)} ({np.sum(high_density_mask)/len(densities)*100:.1f}%)")
-
     return high_density_mask
 
 
-def compute_relative_density(densities, neighbors, k):
+def compute_relative_density(densities, neighbors, k, silent=False):
     """
     计算相对密度，用于更鲁棒的高密度点识别
 
@@ -132,12 +125,11 @@ def compute_relative_density(densities, neighbors, k):
         densities: 绝对密度值数组 (n_samples,)
         neighbors: k近邻索引矩阵 (n_samples, k)
         k: k近邻数量
+        silent: 是否静默模式
 
     Returns:
         relative_densities: 相对密度值数组 (n_samples,)
     """
-    print(f"\n[RELATIVE DENSITY] 计算相对密度...")
-
     n_samples = len(densities)
     rho_mean = np.mean(densities)  # 所有点密度的平均值 ρ̄
 
@@ -159,8 +151,4 @@ def compute_relative_density(densities, neighbors, k):
         denominator = k + neighbor_densities_avg
         relative_densities[i] = (numerator / denominator) * densities[i]
 
-    print(f"   绝对密度统计: min={densities.min():.3f}, max={densities.max():.3f}, mean={densities.mean():.3f}")
-    print(f"   相对密度统计: min={relative_densities.min():.3f}, max={relative_densities.max():.3f}, mean={relative_densities.mean():.3f}")
-
     return relative_densities
-

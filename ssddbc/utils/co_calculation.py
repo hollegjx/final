@@ -22,11 +22,6 @@ def compute_co_value(co_mode, knn_distances, densities, neighbors, k, co_manual=
 
     mean_knn_distance = np.mean(knn_distances)
 
-    if not silent:
-        print(f"\n[CO MODE 2] K近邻平均距离")
-        print(f"   计算方式: mean(所有点的K近邻平均距离)")
-        print(f"   co值: {mean_knn_distance:.4f}")
-
     return mean_knn_distance
 
 
@@ -48,13 +43,6 @@ def apply_co_filter(X, high_density_indices, co, neighbors, high_density_mask, s
     high_density_neighbors_map = {}
     is_scalar_co = isinstance(co, (int, float, np.number))
 
-    if not silent:
-        if is_scalar_co:
-            print(f"\n[CO FILTER] 使用标量co={co:.4f}过滤高密度邻居")
-        else:
-            print(f"\n[CO FILTER] 使用相对co过滤高密度邻居")
-            print(f"   相对co范围: [{co.min():.4f}, {co.max():.4f}]")
-
     for idx in high_density_indices:
         neighbors_in_co = []
 
@@ -73,16 +61,6 @@ def apply_co_filter(X, high_density_indices, co, neighbors, high_density_mask, s
                     neighbors_in_co.append(neighbor_idx)
 
         high_density_neighbors_map[idx] = neighbors_in_co
-
-    if not silent:
-        # 统计邻居数量分布
-        neighbor_counts = [len(neighs) for neighs in high_density_neighbors_map.values()]
-        zero_neighbor_count = sum(1 for count in neighbor_counts if count == 0)
-
-        print(f"   高密度点总数: {len(high_density_indices)}")
-        print(f"   无邻居的点数: {zero_neighbor_count} ({zero_neighbor_count/len(high_density_indices)*100:.1f}%)")
-        print(f"   平均邻居数: {np.mean(neighbor_counts):.2f}")
-        print(f"   中位数邻居数: {np.median(neighbor_counts):.0f}")
 
     return high_density_neighbors_map
 

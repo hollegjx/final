@@ -51,9 +51,6 @@ def build_clusters_ssddbc(X, high_density_mask, neighbors, labeled_mask, targets
         high_density_neighbors_map: 高密度点的邻居映射字典
         cluster_category_labels: 簇ID到类别标签的映射字典（只包含有类别标签的簇）
     """
-    if not silent:
-        print(f"SS-DDBC聚类构建...")
-
     n_samples = X.shape[0]
     cluster_labels = np.full(n_samples, -1, dtype=int)
     clusters = []
@@ -204,8 +201,6 @@ def build_clusters_ssddbc(X, high_density_mask, neighbors, labeled_mask, targets
 
     # 关键修改：在高密度点子空间中重新计算k近邻
     # 这样可以确保每个高密度点的k个邻居都是高密度点
-    if not silent:
-        print(f"   计算高密度点子空间的k近邻...")
     high_density_indices_all = np.where(high_density_mask)[0]
     X_high_density = X[high_density_indices_all]
 
@@ -241,44 +236,6 @@ def build_clusters_ssddbc(X, high_density_mask, neighbors, labeled_mask, targets
         filtered_neighbors = neighbors_high_density_global[i][valid_mask]
         high_density_neighbors_map[global_idx] = filtered_neighbors
 
-    # 分析高密度点子空间中的k近邻距离分布
-    if not silent:
-        print(f"\n📊 高密度点子空间k近邻距离统计:")
-        # 计算每个高密度点在高密度子空间中的k近邻平均距离
-        hd_avg_distances = np.mean(knn_distances_hd, axis=1)
-        hd_mean = np.mean(hd_avg_distances)
-        hd_median = np.median(hd_avg_distances)
-        hd_min = np.min(hd_avg_distances)
-        hd_max = np.max(hd_avg_distances)
-        hd_std = np.std(hd_avg_distances)
-        hd_q25 = np.percentile(hd_avg_distances, 25)
-        hd_q75 = np.percentile(hd_avg_distances, 75)
-
-        print(f"   平均值: {hd_mean:.4f}")
-        print(f"   中位数: {hd_median:.4f}")
-        print(f"   最小值: {hd_min:.4f}")
-        print(f"   最大值: {hd_max:.4f}")
-        print(f"   标准差: {hd_std:.4f}")
-        print(f"   第25百分位: {hd_q25:.4f}")
-        print(f"   第75百分位: {hd_q75:.4f}")
-        print(f"   💡 建议co范围: [{hd_q25:.4f}, {hd_median:.4f}] (25%分位~中位数)")
-
-        if is_scalar_co:
-            print(f"   当前使用co: {co:.4f} (标量)")
-        else:
-            co_high_density = co[high_density_indices_all]
-            print(f"   当前使用co: 相对co，范围[{co_high_density.min():.4f}, {co_high_density.max():.4f}], 平均{co_high_density.mean():.4f}")
-
-    # 统计co距离内没有邻居的高密度点数量
-    zero_neighbor_indices = [idx for idx, neighs in high_density_neighbors_map.items() if len(neighs) == 0]
-    zero_neighbor_count = len(zero_neighbor_indices)
-    if not silent:
-        if is_scalar_co:
-            print(f"   ⚠️  co={co:.4f}距离内没有邻居的高密度点数量: {zero_neighbor_count} / {len(high_density_indices_all)} ({zero_neighbor_count/len(high_density_indices_all)*100:.1f}%)")
-        else:
-            print(f"   ⚠️  相对co距离内没有邻居的高密度点数量: {zero_neighbor_count} / {len(high_density_indices_all)} ({zero_neighbor_count/len(high_density_indices_all)*100:.1f}%)")
-        print(f"   高密度点子空间k近邻计算完成")
-
     # 从每个高密度点开始构建聚类
     high_density_indices = np.where(high_density_mask)[0]
 
@@ -287,28 +244,6 @@ def build_clusters_ssddbc(X, high_density_mask, neighbors, labeled_mask, targets
     high_density_points_with_density = [(idx, densities[idx]) for idx in high_density_indices]
     high_density_points_with_density.sort(key=lambda x: (-x[1], x[0]))  # 密度降序，索引升序
     high_density_indices = [idx for idx, _ in high_density_points_with_density]
-
-    # 🔍 调试：分析高密度点的类别分布
-    if not silent:
-        print(f"\n🔍 高密度点类别分布分析:")
-        known_high_density = 0
-        unknown_high_density = 0
-        for idx in high_density_indices:
-            if known_mask[idx]:
-                known_high_density += 1
-            else:
-                unknown_high_density += 1
-        print(f"   已知类高密度点: {known_high_density}个")
-        print(f"   未知类高密度点: {unknown_high_density}个")
-
-        # 按类别统计
-        class_high_density_count = {}
-        for idx in high_density_indices:
-            true_label = targets[idx]
-            if true_label not in class_high_density_count:
-                class_high_density_count[true_label] = 0
-            class_high_density_count[true_label] += 1
-        print(f"   各类别高密度点数: {class_high_density_count}")
 
     for xi_idx in high_density_indices:
         if cluster_labels[xi_idx] != -1:
@@ -473,9 +408,5 @@ def build_clusters_ssddbc(X, high_density_mask, neighbors, labeled_mask, targets
     for new_id, cluster in enumerate(non_empty_clusters):
         for idx in cluster:
             cluster_labels_new[idx] = new_id
-
-    if not silent:
-        print(f"   SS-DDBC聚类数量: {len(non_empty_clusters)}")
-        print(f"   已分配样本: {np.sum(cluster_labels_new != -1)} / {n_samples}")
 
     return non_empty_clusters, cluster_labels_new, high_density_neighbors_map, new_cluster_category_labels

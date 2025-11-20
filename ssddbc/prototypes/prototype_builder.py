@@ -25,8 +25,6 @@ def build_prototypes(X, clusters, labeled_mask, targets):
         prototypes: 每个聚类的原型 (聚类中心)
         prototype_labels: 每个聚类的主导标签
     """
-    print(f"   建立聚类原型...")
-
     prototypes = []
     prototype_labels = []
 
@@ -49,5 +47,4 @@ def build_prototypes(X, clusters, labeled_mask, targets):
             # 无有标签样本，标记为未知类 (-1)
             prototype_labels.append(-1)
 
-    print(f"   建立原型完成: {len(prototypes)}个原型")
     return np.array(prototypes), np.array(prototype_labels)

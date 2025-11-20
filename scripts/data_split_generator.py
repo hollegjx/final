@@ -352,11 +352,14 @@ class GCDSuperclassSplitter:
 
 def main():
     """主函数"""
-    parser = argparse.ArgumentParser(description='GCD项目超类数据划分生成器')
+    parser = argparse.ArgumentParser(
+        description='GCD项目超类数据划分生成器',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
     parser.add_argument('--output_dir', type=str, default='./data_splits',
-                        help='输出目录路径')
+                        help='划分结果与摘要文件的输出目录')
     parser.add_argument('--cifar100_root', type=str, default='./data',
-                        help='CIFAR-100数据集根目录')
+                        help='CIFAR-100数据集根目录（若不存在可自动下载）')
 
     args = parser.parse_args()
 

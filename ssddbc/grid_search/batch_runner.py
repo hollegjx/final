@@ -108,7 +108,7 @@ def _run_single_process(args_tuple):
                 co_manual=co_manual,
                 use_l2=use_l2,
                 eval_dense=eval_dense,
-                silent=True,
+                fast_mode=True,
                 dense_method=dense_method,
                 assign_model=assign_model,
                 voting_k=voting_k,
@@ -177,7 +177,7 @@ def _run_single(
                 co_manual=co_manual,
                 use_l2=use_l2,
                 eval_dense=eval_dense,
-                silent=True,
+                fast_mode=True,
                 dense_method=dense_method,
                 assign_model=assign_model,
                 voting_k=voting_k,
@@ -246,7 +246,7 @@ def run_grid_search(
             eval_version, co_mode, manual_co, use_l2, eval_dense, dense_method,
             assign_model, voting_k, use_train_and_test, detail_dense,
             use_cluster_quality, cluster_distance_method, l1_type,
-            1.0, 1.0, l2_components, None, feature_cache_dir, max_workers
+            0.0, 1.0, l2_components, {'silhouette': 3.0}, feature_cache_dir, max_workers
         )
     else:
         return _run_serial_grid_search(
@@ -254,7 +254,7 @@ def run_grid_search(
             eval_version, co_mode, manual_co, use_l2, eval_dense, dense_method,
             assign_model, voting_k, use_train_and_test, detail_dense,
             use_cluster_quality, cluster_distance_method, l1_type,
-            1.0, 1.0, l2_components, None, feature_cache_dir
+            0.0, 1.0, l2_components, {'silhouette': 3.0}, feature_cache_dir
         )
 
 

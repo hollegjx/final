@@ -34,7 +34,7 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
                                          run_kmeans_baseline=False,
                                          use_l2=True,
                                          feature_cache_dir=None,
-                                         eval_dense=False, silent=False,
+                                         eval_dense=False, fast_mode=False,
                                          dense_method=0, assign_model=2, voting_k=5,
                                          co_mode=2, co_manual=None, detail_dense=False,
                                          label_guide=False,
@@ -61,7 +61,7 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
         use_l2: 是否使用L2归一化特征
         feature_cache_dir: 特征缓存根目录（None 时使用配置默认路径）
         eval_dense: 是否仅评估高密度点
-        silent: 静默模式
+        fast_mode: 快速模式，跳过不必要的计算（未知簇识别、簇类别标签），默认False
         dense_method: 密度计算方法
         assign_model: 稀疏点分配策略
         voting_k: KNN投票邻居数量
@@ -76,7 +76,7 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
     Returns:
         results: 结果字典
     """
-    if not silent:
+    if not fast_mode:
         print(f"🧪 测试自适应聚类 - 超类: {superclass_name}")
         print("="*80)
 
@@ -84,7 +84,7 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
     superclass_info = get_superclass_info(superclass_name)
     known_classes_mapped = superclass_info['known_classes_mapped']
 
-    if not silent:
+    if not fast_mode:
         print(f"📊 超类信息:")
         print(f"   原始已知类: {superclass_info['known_classes']} -> 映射后: {sorted(list(known_classes_mapped))}")
         print(f"   原始未知类: {superclass_info['unknown_classes']} -> 映射后: {sorted(list(superclass_info['unknown_classes_mapped']))}")
@@ -96,11 +96,11 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
         model_path=model_path,
         use_l2=use_l2,
         use_train_and_test=use_train_and_test,
-        silent=silent
+        silent=fast_mode
     )
 
     # 打印数据集摘要（替代原来的8行手动打印）
-    dataset.print_summary(silent=silent)
+    dataset.print_summary(silent=fast_mode)
 
     # ========== 步骤3: 获取聚类输入（一行代码） ==========
     X, targets, known_mask, labeled_mask, train_size = dataset.get_clustering_input()
@@ -111,33 +111,34 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
         k=k, density_percentile=density_percentile, random_state=random_state,
         train_size=train_size,
         eval_dense=eval_dense, eval_version=eval_version,
-        silent=silent,
+        fast_mode=fast_mode,  # 传递 fast_mode 参数
         dense_method=dense_method,
         assign_model=assign_model,
         voting_k=voting_k,
         co_mode=co_mode,
         co_manual=co_manual,
-        detail_dense=False if silent else detail_dense,
-        label_guide=label_guide
+        detail_dense=False if fast_mode else detail_dense,
+        label_guide=label_guide,
     )
 
     # 轻量精简：不再更新日志中的数据集名称（detail_dense 功能保留在核心算法中）
 
     # ========== 步骤5: 处理聚类结果和计算ACC ==========
     if eval_dense:
-        predictions, n_clusters, unknown_clusters, all_acc, old_acc, new_acc, _, neighbors, core_clusters = clustering_result
-        prototypes = None  # eval_dense模式不返回prototypes
+        (predictions, n_clusters, unknown_clusters, all_acc, old_acc, new_acc, _,
+         neighbors, core_clusters, densities) = clustering_result
         clusters = None  # updated_clusters
         cluster_category_labels = {}  # eval_dense模式不返回cluster_category_labels
-        if not silent:
+        if not fast_mode:
             print(f"\n📊 eval_dense模式: 使用高密度点评估结果")
     else:
-        predictions, n_clusters, unknown_clusters, prototypes, clusters, cluster_category_labels, neighbors, core_clusters = clustering_result
+        (predictions, n_clusters, unknown_clusters, clusters,
+         cluster_category_labels, neighbors, core_clusters, densities) = clustering_result
 
         # 获取测试集数据（使用dataset便捷方法，一行代码替代10行）
         test_data = dataset.get_test_subset(predictions)
 
-        if not silent:
+        if not fast_mode:
             print(f"📊 ACC计算范围: {'测试集' if dataset.has_train_test_split else '全部数据'} ({test_data['n_samples']}个样本)")
 
         # 使用簇ID直接计算ACC（不转换为类别标签）
@@ -189,7 +190,7 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
 
         correct_count = test_data['n_samples'] - error_count
 
-        if not silent:
+        if not fast_mode:
             print(f"\n[DEBUG] 混淆矩阵前3行:")
             for i in range(min(3, len(w))):
                 print(f"  簇{i}: {w[i][:10]} (总和={w[i].sum()})")
@@ -201,9 +202,9 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
             print(f"   错误样本: {error_count}/{test_data['n_samples']} ({error_count/test_data['n_samples']:.2%})")
 
     # ========== 步骤6: 显示聚类组成分析 ==========
-    if not eval_dense and not silent:
+    if not eval_dense and not fast_mode:
         analyze_cluster_composition(predictions, targets, known_mask, labeled_mask, unknown_clusters)
-    elif not silent:
+    elif not fast_mode:
         print(f"\n💡 eval_dense模式: 跳过聚类组成分析（仅评估高密度骨干网络）")
 
     # ========== 步骤7: 计算综合损失L ==========
@@ -258,7 +259,7 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
         neighbors=neighbors,  # 传递预计算的neighbors，避免重复计算KNN
         separation_weight=separation_weight,  # L2中簇间分离度权重
         penalty_weight=penalty_weight,  # L2中局部密度惩罚权重
-        silent=silent,
+        silent=fast_mode,
         l2_components=resolved_l2_components,
         l2_component_weights=resolved_l2_weights,
         l2_component_params=resolved_l2_params
@@ -272,13 +273,13 @@ def test_adaptive_clustering_on_superclass(superclass_name, model_path,
             targets=targets,
             labeled_mask=labeled_mask,
             unknown_clusters=unknown_clusters,
-            silent=silent
+            silent=fast_mode
         )
         # 用新的labeled_acc覆盖原来的
         loss_dict['l1_metrics']['accuracy'] = labeled_acc_new
         loss_dict['l1_metrics'].update(labeled_acc_metrics)
 
-    if not silent:
+    if not fast_mode:
         print(f"📈 聚类结果:")
         print(f"   聚类数量: {n_clusters}")
         print(f"   潜在未知类: {len(unknown_clusters)}个")

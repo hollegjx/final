@@ -42,6 +42,7 @@ from methods.contrastive_training.contrastive_training import (
 from utils.training_utils import TrainingSession
 from utils.checkpoint_utils import save_training_state, load_training_state
 from utils.pseudo_labels import load_pseudo_label_cache
+from utils.best_model_tracker import BestModelTracker
 
 # 导入超类模型保存器
 from project_utils.superclass_model_saver import create_superclass_model_saver
@@ -88,10 +89,15 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         )
 
     sup_con_crit = SupConLoss()
-    # 使用all_acc_test追踪最佳表现，供模型保存和返回值使用
-    best_test_acc_lab = 0
+
+    # 初始化最佳模型追踪器（使用 JSON 文件持久化全局最佳信息）
+    best_model_tracker = BestModelTracker(args.exp_root)
+    best_test_acc_lab = best_model_tracker.get_best_acc()
 
     is_grid_search = getattr(args, 'is_grid_search', False)
+
+    if not is_grid_search and best_test_acc_lab > 0:
+        print(f"📊 从 JSON 恢复全局最佳 ACC: {best_test_acc_lab:.4f} (epoch {best_model_tracker.get_best_epoch()})")
 
     # 初始化训练会话管理器
     training_session = TrainingSession(args, enable_early_stopping=False, patience=20, quiet=is_grid_search)
@@ -101,6 +107,23 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
     }
     training_session.start_training(model_info)
     setattr(args, "pseudo_cache", pseudo_cache)
+    pseudo_weight_mode = getattr(args, "pseudo_weight_mode", "none")
+    valid_weight_modes = {"none", "density"}
+    if pseudo_weight_mode not in valid_weight_modes:
+        raise ValueError(f"不支持的 pseudo_weight_mode: {pseudo_weight_mode}")
+    effective_weight_mode = pseudo_weight_mode
+    if pseudo_cache is None:
+        if pseudo_weight_mode != "none" and not is_grid_search:
+            print("⚠️  未提供伪标签文件，忽略 pseudo_weight_mode 设置")
+        effective_weight_mode = "none"
+    elif pseudo_weight_mode == "density" and not pseudo_cache.has_density_weights:
+        if not is_grid_search:
+            print("⚠️  伪标签文件缺少密度信息，无法按密度加权，退回均匀权重")
+        effective_weight_mode = "none"
+    args.pseudo_weight_mode_effective = effective_weight_mode
+    if pseudo_cache is not None and not is_grid_search:
+        mode_desc = "按密度加权" if effective_weight_mode == "density" else "均匀权重"
+        print(f"   伪标签损失权重模式: {mode_desc}")
 
     epoch_progress = None
     if is_grid_search and progress_parent is not None:
@@ -153,6 +176,8 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         if train_stats:
             args.writer.add_scalar('Pseudo/train_core_ratio', train_stats.get('core_ratio', 0.0), start_epoch)
             args.writer.add_scalar('Pseudo/train_core_count', train_stats.get('core_count', 0), start_epoch)
+        args.writer.add_scalar('Pseudo/weight_mode_flag', 1 if args.pseudo_weight_mode_effective == 'density' else 0, start_epoch)
+        args.writer.add_text('Pseudo/weight_mode', args.pseudo_weight_mode_effective, start_epoch)
 
     for epoch in range(start_epoch, args.epochs):
         if epoch_progress:
@@ -165,7 +190,7 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         contrastive_loss_record = AverageMeter()
         sup_con_loss_record = AverageMeter()
         pseudo_loss_record = AverageMeter()
-        pseudo_core_record = AverageMeter()
+        pseudo_sample_record = AverageMeter()
         train_acc_record = AverageMeter()
 
         # 定义轮次级别的权重变量，避免批次内重复定义
@@ -186,6 +211,7 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
             mask_lab = mask_lab[:, 0]
 
             class_labels, mask_lab = class_labels.to(args.device), mask_lab.to(args.device).bool()
+            mask_lab_np = mask_lab.detach().cpu().numpy()
             images = torch.cat(images, dim=0).to(args.device)
 
             # Extract features with base model
@@ -220,31 +246,42 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
 
             # 伪标签对比损失
             pseudo_loss = torch.tensor(0.0, device=args.device)
-            pseudo_core_count = 0
+            pseudo_sample_count = 0
             if pseudo_cache is not None:
                 if isinstance(uq_idxs, torch.Tensor):
                     batch_indices_np = uq_idxs.detach().cpu().numpy().astype(np.int64)
                 else:
                     batch_indices_np = np.asarray(uq_idxs, dtype=np.int64)
                 pseudo_labels_np = pseudo_cache.lookup_labels(batch_indices_np)
-                pseudo_core_mask_np = pseudo_cache.lookup_core_mask(batch_indices_np)
-                if pseudo_core_mask_np.any():
+                unlabeled_mask_np = ~mask_lab_np
+                valid_mask_np = np.logical_and(pseudo_labels_np >= 0, unlabeled_mask_np)
+                if valid_mask_np.any():
                     pseudo_labels_tensor = torch.from_numpy(
-                        pseudo_labels_np[pseudo_core_mask_np]
+                        pseudo_labels_np[valid_mask_np]
                     ).long().to(args.device)
-                    core_mask_tensor = torch.from_numpy(pseudo_core_mask_np).to(args.device)
-                    f1_pseudo, f2_pseudo = [f[core_mask_tensor] for f in features.chunk(2)]
+                    pseudo_mask_tensor = torch.from_numpy(valid_mask_np).to(args.device)
+                    f1_pseudo, f2_pseudo = [f[pseudo_mask_tensor] for f in features.chunk(2)]
                     if f1_pseudo.size(0) > 0:
                         pseudo_feats = torch.cat([f1_pseudo.unsqueeze(1), f2_pseudo.unsqueeze(1)], dim=1)
-                        pseudo_loss = sup_con_crit(pseudo_feats, labels=pseudo_labels_tensor)
-                        pseudo_core_count = int(pseudo_labels_tensor.size(0))
+                        if args.pseudo_weight_mode_effective == 'density':
+                            weight_values = pseudo_cache.lookup_weights(batch_indices_np)[valid_mask_np]
+                        else:
+                            weight_values = np.ones(pseudo_labels_tensor.size(0), dtype=np.float32)
+                        pseudo_weights_tensor = torch.from_numpy(weight_values).to(args.device)
+                        pseudo_loss = sup_con_crit(
+                            pseudo_feats,
+                            labels=pseudo_labels_tensor,
+                            sample_weights=pseudo_weights_tensor,
+                        )
+                        pseudo_sample_count = int(pseudo_labels_tensor.size(0))
 
-            gamma = get_gamma(epoch, warmup_epochs=50, total_epochs=args.epochs)
+            gamma = get_gamma(epoch, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
 
-            # 总损失 = 无监督对比损失 + 监督对比损失 + γ·伪标签损失
+            # 总损失 = 无监督对比损失 + 监督对比损失 + γ·pseudo_loss_weight·伪标签损失
             loss = epoch_contrastive_weight * contrastive_loss + epoch_sup_con_weight * sup_con_loss
-            if pseudo_cache is not None and pseudo_core_count > 0:
-                loss = loss + gamma * pseudo_loss
+            if pseudo_cache is not None and pseudo_sample_count > 0:
+                pseudo_loss_weight = getattr(args, 'pseudo_loss_weight', 1.0)
+                loss = loss + gamma * pseudo_loss_weight * pseudo_loss
 
             # Train acc
             _, pred = contrastive_logits.max(1)
@@ -256,8 +293,8 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
             contrastive_loss_record.update(contrastive_loss.item(), class_labels.size(0))
             sup_con_loss_record.update(sup_con_loss.item(), class_labels.size(0))
             if pseudo_cache is not None:
-                pseudo_loss_record.update(pseudo_loss.item(), max(pseudo_core_count, 1))
-                pseudo_core_record.update(pseudo_core_count, 1)
+                pseudo_loss_record.update(pseudo_loss.item(), max(pseudo_sample_count, 1))
+                pseudo_sample_record.update(pseudo_sample_count, 1)
 
             optimizer.zero_grad()
             loss.backward()
@@ -286,19 +323,20 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         lr_value = get_mean_lr(optimizer)
 
         if not is_grid_search:
+            pseudo_loss_weight = getattr(args, 'pseudo_loss_weight', 1.0)
             print(f"\n📊 Epoch {epoch+1}/{args.epochs} 损失分解:")
-            print(f"   总损失 = {epoch_contrastive_weight:.2f}*对比损失 + {epoch_sup_con_weight:.2f}*监督对比损失 + γ*伪标签损失")
+            print(f"   总损失 = {epoch_contrastive_weight:.2f}*对比损失 + {epoch_sup_con_weight:.2f}*监督对比损失 + γ*λ*伪标签损失")
             print(
                 f"   总损失 = {epoch_contrastive_weight:.2f}*{contrastive_loss_record.avg:.4f} "
                 f"+ {epoch_sup_con_weight:.2f}*{sup_con_loss_record.avg:.4f} "
-                f"+ {gamma:.2f}*{pseudo_loss_record.avg:.4f} = {loss_record.avg:.4f}"
+                f"+ {gamma:.2f}*{pseudo_loss_weight:.2f}*{pseudo_loss_record.avg:.4f} = {loss_record.avg:.4f}"
             )
             print(f"   对比学习损失: {contrastive_loss_record.avg:.4f}")
             print(f"   监督对比损失: {sup_con_loss_record.avg:.4f}")
             if pseudo_cache is not None:
                 print(
                     f"   伪标签损失: {pseudo_loss_record.avg:.4f} "
-                    f"(每批核心点≈{pseudo_core_record.avg:.1f})"
+                    f"(每批伪标签样本≈{pseudo_sample_record.avg:.1f})"
                 )
             print(f"   训练准确率: {train_acc_record.avg:.4f}")
             print(f"   学习率: {lr_value:.6f}")
@@ -321,14 +359,17 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         args.writer.add_scalar('Train Acc Labelled Data', train_acc_record.avg, epoch)
         args.writer.add_scalar('LR', get_mean_lr(optimizer), epoch)
 
-        # 2) 计算并记录当前 epoch 的 γ（伪标签损失权重，占位）
-        gamma = get_gamma(epoch, warmup_epochs=50, total_epochs=args.epochs)
+        # 2) 计算并记录当前 epoch 的 γ（伪标签损失权重）
+        gamma = get_gamma(epoch, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
+        pseudo_loss_weight = getattr(args, 'pseudo_loss_weight', 1.0)
         args.writer.add_scalar('Pseudo/gamma', gamma, epoch)
+        args.writer.add_scalar('Pseudo/loss_weight', pseudo_loss_weight, epoch)
+        args.writer.add_scalar('Pseudo/effective_weight', gamma * pseudo_loss_weight, epoch)
         if pseudo_cache is not None:
             args.writer.add_scalar('Loss/Pseudo', pseudo_loss_record.avg, epoch)
-            args.writer.add_scalar('Pseudo/core_per_batch', pseudo_core_record.avg, epoch)
+            args.writer.add_scalar('Pseudo/samples_per_batch', pseudo_sample_record.avg, epoch)
         if not is_grid_search:
-            print(f"   伪标签权重 γ(epoch={epoch}) = {gamma:.4f}")
+            print(f"   伪标签权重 γ(epoch={epoch}) = {gamma:.4f}, λ = {pseudo_loss_weight:.2f}, 有效权重 = {gamma * pseudo_loss_weight:.4f}")
 
         # 3) 伪标签刷新钩子（已由离线 Stage2 取代，避免在训练内部重复聚类）
 
@@ -367,6 +408,29 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
                 }
             )
             best_test_acc_lab = all_acc_test
+
+            # 更新 JSON 文件记录全局最佳信息
+            stage_name = "stage3" if getattr(args, "resume_from_ckpt", None) else "stage1"
+            best_model_tracker.update_if_better(
+                new_acc=all_acc_test,
+                epoch=epoch + 1,
+                model_path=os.path.relpath(best_model_path, args.exp_root),
+                proj_path=os.path.relpath(best_proj_path, args.exp_root),
+                metadata={
+                    'all_acc': all_acc_test,
+                    'old_acc': old_acc_test,
+                    'new_acc': new_acc_test,
+                    'train_loss': loss_record.avg,
+                    'train_acc': train_acc_record.avg
+                },
+                hyperparameters={
+                    'lr': args.lr,
+                    'sup_con_weight': args.sup_con_weight,
+                    'grad_from_block': args.grad_from_block,
+                    'total_epochs': args.epochs
+                },
+                stage=stage_name
+            )
 
         # 可选：保存完整训练状态检查点，便于后续验证断点续训
         if getattr(args, "save_ckpt_every", 0) and (epoch + 1) % args.save_ckpt_every == 0:
@@ -412,15 +476,25 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
     # 训练结束，显示最佳模型信息
     if not is_grid_search:
         print(f"\n📊 超类 '{args.superclass_name}' 训练完成")
-        best_model_info = model_saver.get_best_model_info()
+
+        # 使用持久化的 BestModelTracker（与 pipeline 保持一致）
+        best_acc = best_model_tracker.get_best_acc()
+        best_epoch = best_model_tracker.get_best_epoch()
+
         print(f"🏆 最佳模型信息:")
-        print(f"   最佳ACC: {best_model_info['best_acc']:.4f}")
-        if best_model_info['model_path']:
-            print(f"   模型文件: {os.path.basename(best_model_info['model_path'])}")
-            print(f"   投影头: {os.path.basename(best_model_info['proj_path'])}")
-            print(f"   保存目录: {best_model_info['save_dir']}")
+        if best_acc > 0:
+            print(f"   最佳ACC: {best_acc:.4f} (epoch {best_epoch})")
+            # 显示详细的准确率分解
+            tracker_data = best_model_tracker.load()  # 使用 load() 方法而不是 data 属性
+            if tracker_data.get('metadata'):
+                metadata = tracker_data['metadata']
+                old_acc = metadata.get('old_acc', 0)
+                new_acc = metadata.get('new_acc', 0)
+                if old_acc > 0 or new_acc > 0:
+                    print(f"   Old ACC: {old_acc:.4f}")
+                    print(f"   New ACC: {new_acc:.4f}")
         else:
-            print("   未保存任何最佳模型 (可能未达到保存条件)")
+            print("   尚未记录最佳模型")
 
     return model, projection_head, best_test_acc_lab
 
@@ -736,7 +810,7 @@ def train_single_superclass(args, model_saver=None, progress_parent=None):
         progress_parent=progress_parent,
         feature_cache_args={
             "superclass_name": args.superclass_name,
-            "cache_dir": getattr(args, "feature_cache_dir_override", feature_cache_dir),
+            "cache_dir": args.feature_cache_dir if args.feature_cache_dir else feature_cache_dir,
             "batch_size": args.batch_size,
             "num_workers": args.num_workers,
             "gpu": args.gpu,
@@ -823,12 +897,21 @@ def build_superclass_train_parser(add_help=True):
                         help='可选：每隔多少个epoch保存一次完整训练检查点（0表示不自动保存）。')
     parser.add_argument('--pseudo_labels_path', type=str, default=None,
                         help='可选：离线 SSDDBC 生成的伪标签文件(.npz)路径。提供后训练会加载伪标签进行阶段2/3实验。')
+    parser.add_argument('--pseudo_weight_mode', type=str, default='none',
+                        choices=['none', 'density'],
+                        help='伪标签损失权重模式：none=均匀取权，density=按密度sigmoid加权。')
+    parser.add_argument('--pseudo_loss_weight', type=float, default=1.0,
+                        help='伪标签损失的整体权重系数，最终权重 = γ * pseudo_loss_weight（默认: 1.0）')
+    parser.add_argument('--warmup_epochs', type=int, default=50,
+                        help='伪标签权重预热轮数，epoch < warmup_epochs 时 γ=0（默认: 50）')
     parser.add_argument('--reuse_log_dir', type=str, default=None,
                         help='可选：复用既有 TensorBoard 日志目录，便于在多阶段训练中拼接曲线。')
     parser.add_argument('--stop_at_epoch', type=int, default=None,
                         help='可选：在指定 epoch 后提前停止训练，常用于阶段1预热。')
     parser.add_argument('--save_features_and_exit', action='store_true',
                         help='可选：在 stop_at_epoch 停止时自动触发特征缓存脚本。')
+    parser.add_argument('--feature_cache_dir', type=str, default=None,
+                        help='可选：特征缓存目录。未指定时使用 config.py 中的默认值。')
 
     # =====================================================================
     # 对比学习框架参数

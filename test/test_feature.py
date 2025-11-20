@@ -23,7 +23,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.augmentations import get_transform
 from data.cifar100_superclass import CIFAR100_SUPERCLASSES, get_single_superclass_datasets
 from models import vision_transformer as vits
-from config import dino_pretrain_path
+from config import dino_pretrain_path, feature_cache_dir, feature_cache_dir_nol2
 from project_utils.general_utils import str2bool
 from data.data_utils import MergedDataset
 
@@ -143,7 +143,7 @@ def extract_features(data_loader, model, device, known_classes=None, dataset_typ
     return all_feats, targets.astype(int), mask.astype(bool), labeled_mask.astype(bool)
 
 
-def extract_and_save_features(superclass_name, model_path, output_base_dir='/data/gjx/checkpoints/features', use_l2=True):
+def extract_and_save_features(superclass_name, model_path, output_base_dir=None, use_l2=True):
     """
     提取并保存指定超类的特征
 
@@ -153,6 +153,10 @@ def extract_and_save_features(superclass_name, model_path, output_base_dir='/dat
         output_base_dir: 输出基础目录
         use_l2: 是否使用L2归一化 (True=L2归一化, False=不使用)
     """
+    # 设置默认输出目录
+    if output_base_dir is None:
+        output_base_dir = feature_cache_dir if use_l2 else feature_cache_dir_nol2
+
     l2_status = "L2归一化" if use_l2 else "无L2归一化"
     print(f"🚀 开始提取和保存特征 ({l2_status}) - 超类: {superclass_name}")
     print("="*80)
@@ -338,7 +342,7 @@ def extract_and_save_features(superclass_name, model_path, output_base_dir='/dat
     return feature_data
 
 
-def load_saved_features(superclass_name, output_base_dir='/data/gjx/checkpoints/features'):
+def load_saved_features(superclass_name, output_base_dir=None):
     """
     加载已保存的特征数据
 
@@ -349,6 +353,10 @@ def load_saved_features(superclass_name, output_base_dir='/data/gjx/checkpoints/
     Returns:
         feature_data: 特征数据字典
     """
+    # 设置默认输出目录
+    if output_base_dir is None:
+        output_base_dir = feature_cache_dir
+
     feature_file = os.path.join(output_base_dir, superclass_name, 'features.pkl')
 
     if not os.path.exists(feature_file):
@@ -403,7 +411,7 @@ def main():
         '--output_base_dir',
         type=str,
         default=None,
-        help='特征缓存的根目录，内部会自动创建 <root>/<superclass>/features.pkl。未指定时按 --l2 自动落在 /data/gjx/checkpoints/features[_nol2]。'
+        help='特征缓存的根目录，内部会自动创建 <root>/<superclass>/features.pkl。未指定时按 --l2 自动使用 config 中配置的目录。'
     )
 
     args = parser.parse_args()
@@ -412,7 +420,7 @@ def main():
     if args.output_base_dir:
         output_base_dir = args.output_base_dir
     else:
-        output_base_dir = '/data/gjx/checkpoints/features' if args.l2 else '/data/gjx/checkpoints/features_nol2'
+        output_base_dir = feature_cache_dir if args.l2 else feature_cache_dir_nol2
 
     print("特征提取和保存工具")
     print("="*80)

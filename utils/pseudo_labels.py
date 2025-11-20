@@ -41,6 +41,7 @@ class PseudoLabelPacket:
         core_mask: 核心点布尔数组 (N,)
         best_params: SSDDBC 搜索的最佳参数
         metadata: 其他统计信息（ACC、来源 ckpt、生成时间等）
+        densities: 样本密度值（可选，用于伪标签加权）
     """
 
     indices: np.ndarray
@@ -48,6 +49,7 @@ class PseudoLabelPacket:
     core_mask: np.ndarray
     best_params: Dict[str, Any]
     metadata: Dict[str, Any]
+    densities: Optional[np.ndarray] = None
 
     def core_indices(self) -> np.ndarray:
         """返回核心点对应的原始索引。"""
@@ -65,6 +67,11 @@ class PseudoLabelPacket:
                 "indices/labels/core_mask 长度不一致: "
                 f"{n}, {self.labels.shape[0]}, {self.core_mask.shape[0]}"
             )
+        if self.densities is not None and self.densities.shape[0] != n:
+            raise PseudoLabelSchemaError(
+                "densities 长度与 indices 不一致: "
+                f"{n}, {self.densities.shape[0]}"
+            )
 
 
 @dataclass
@@ -79,6 +86,7 @@ class PseudoLabelCache:
     dense_labels: np.ndarray
     dense_core_mask: np.ndarray
     present_mask: np.ndarray
+    dense_weights: Optional[np.ndarray] = None
     path: Optional[str] = None
 
     @classmethod
@@ -93,17 +101,24 @@ class PseudoLabelCache:
         dense_labels = np.full(max_index + 1, -1, dtype=packet.labels.dtype)
         dense_core_mask = np.zeros(max_index + 1, dtype=bool)
         present_mask = np.zeros(max_index + 1, dtype=bool)
+        dense_weights = np.zeros(max_index + 1, dtype=np.float32)
 
         indices = packet.indices.astype(np.int64)
         dense_labels[indices] = packet.labels
         dense_core_mask[indices] = packet.core_mask
         present_mask[indices] = True
+        if packet.densities is not None:
+            weights = _compute_density_weights(packet.densities)
+            dense_weights[indices] = weights.astype(np.float32)
+        else:
+            dense_weights[indices] = 1.0
 
         return cls(
             packet=packet,
             dense_labels=dense_labels,
             dense_core_mask=dense_core_mask,
             present_mask=present_mask,
+            dense_weights=dense_weights,
             path=path,
         )
 
@@ -120,6 +135,10 @@ class PseudoLabelCache:
         if self.num_total == 0:
             return 0.0
         return float(self.num_core) / float(self.num_total)
+
+    @property
+    def has_density_weights(self) -> bool:
+        return self.packet.densities is not None
 
     def missing_mask(self, indices: np.ndarray) -> np.ndarray:
         """返回给定索引是否缺少伪标签的布尔掩码。"""
@@ -173,6 +192,19 @@ class PseudoLabelCache:
         result[valid] = self.dense_core_mask[idx[valid]]
         return result
 
+    def lookup_weights(self, indices: np.ndarray) -> np.ndarray:
+        """返回给定索引的伪标签权重（缺失为0）。"""
+        idx = np.asarray(indices, dtype=np.int64)
+        result = np.zeros(idx.shape, dtype=np.float32)
+        valid = ~self.missing_mask(idx)
+        if not np.any(valid):
+            return result
+        if self.dense_weights is None:
+            result[valid] = 1.0
+        else:
+            result[valid] = self.dense_weights[idx[valid]]
+        return result
+
 
 def _ensure_numpy_1d(value: Any, *, name: str, dtype: Optional[np.dtype] = None) -> np.ndarray:
     array = np.asarray(value)
@@ -200,12 +232,53 @@ def _restore_object(arr: np.ndarray, *, name: str) -> Dict[str, Any]:
     return value
 
 
+def _compute_density_weights(densities: np.ndarray) -> np.ndarray:
+    """
+    根据密度值生成 [0, 1] 之间的权重，遵循 sigmoid(12 * (rank - 0.5)) 公式。
+
+    Args:
+        densities: 一维密度数组
+
+    Returns:
+        与输入等长的权重数组
+    """
+    values = np.asarray(densities, dtype=np.float64)
+    if values.ndim != 1:
+        raise PseudoLabelSchemaError(f"densities 需要是一维数组，实际 ndim={values.ndim}")
+    n = values.size
+    if n == 0:
+        return np.array([], dtype=np.float32)
+
+    order = np.argsort(values, kind='mergesort')
+    sorted_values = values[order]
+    ranks = np.empty(n, dtype=np.float64)
+
+    start = 0
+    current_rank = 1.0
+    while start < n:
+        end = start + 1
+        while end < n and np.isclose(sorted_values[end], sorted_values[start]):
+            end += 1
+        count = end - start
+        first_rank = current_rank
+        last_rank = current_rank + count - 1
+        avg_rank = (first_rank + last_rank) / 2.0
+        ranks[order[start:end]] = avg_rank
+        current_rank += count
+        start = end
+
+    normalized = ranks / n
+    weights = 1.0 / (1.0 + np.exp(-12.0 * (normalized - 0.5)))
+    return weights.astype(np.float32)
+
+
 def save_pseudo_labels(
     path: str,
     *,
     indices: Any,
     labels: Any,
     core_mask: Any,
+    densities: Any = None,
     best_params: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     use_compression: bool = True,
@@ -218,22 +291,32 @@ def save_pseudo_labels(
     indices_np = _ensure_numpy_1d(indices, name="indices", dtype=np.int64)
     labels_np = _ensure_numpy_1d(labels, name="labels")
     core_mask_np = _ensure_numpy_1d(core_mask, name="core_mask").astype(bool)
+    densities_np = None
+    if densities is not None:
+        densities_np = _ensure_numpy_1d(densities, name="densities").astype(np.float32)
 
     if len(indices_np) != len(labels_np) or len(indices_np) != len(core_mask_np):
         raise PseudoLabelSchemaError(
             f"indices/labels/core_mask 长度必须一致，当前分别为 "
             f"{len(indices_np)}, {len(labels_np)}, {len(core_mask_np)}"
         )
+    if densities_np is not None and len(indices_np) != len(densities_np):
+        raise PseudoLabelSchemaError(
+            f"densities 长度必须与 indices 一致，当前为 "
+            f"{len(indices_np)} vs {len(densities_np)}"
+        )
 
     saver = np.savez_compressed if use_compression else np.savez
-    saver(
-        path,
-        indices=indices_np,
-        labels=labels_np,
-        core_mask=core_mask_np,
-        best_params=_pack_object(best_params),
-        metadata=_pack_object(metadata),
-    )
+    payload = {
+        "indices": indices_np,
+        "labels": labels_np,
+        "core_mask": core_mask_np,
+        "best_params": _pack_object(best_params),
+        "metadata": _pack_object(metadata),
+    }
+    if densities_np is not None:
+        payload["densities"] = densities_np
+    saver(path, **payload)
 
 
 def load_pseudo_labels(path: str) -> PseudoLabelPacket:
@@ -261,6 +344,7 @@ def load_pseudo_labels(path: str) -> PseudoLabelPacket:
         metadata = (
             _restore_object(data["metadata"], name="metadata") if "metadata" in data else {}
         )
+        densities = data["densities"].astype(np.float32) if "densities" in data else None
 
     packet = PseudoLabelPacket(
         indices=indices,
@@ -268,6 +352,7 @@ def load_pseudo_labels(path: str) -> PseudoLabelPacket:
         core_mask=core_mask,
         best_params=best_params,
         metadata=metadata,
+        densities=densities,
     )
     packet.validate()
     return packet

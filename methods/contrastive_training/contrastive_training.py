@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+from typing import Optional
 
 from torch.utils.data import DataLoader
 import numpy as np
@@ -179,7 +180,7 @@ class SupConLoss(torch.nn.Module):
         self.contrast_mode = contrast_mode
         self.base_temperature = base_temperature
 
-    def forward(self, features, labels=None, mask=None):
+    def forward(self, features, labels=None, mask=None, sample_weights: Optional[torch.Tensor] = None):
         """Compute loss for model. If both `labels` and `mask` are None,
         it degenerates to SimCLR unsupervised loss:
         https://arxiv.org/pdf/2002.05709.pdf
@@ -255,7 +256,28 @@ class SupConLoss(torch.nn.Module):
 
         # loss
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
-        loss = loss.view(anchor_count, batch_size).mean()
+        loss = loss.view(anchor_count, batch_size)
+
+        if sample_weights is not None:
+            sample_weights = sample_weights.to(device=device, dtype=loss.dtype)
+            if sample_weights.dim() != 1 or sample_weights.numel() != batch_size:
+                raise ValueError(
+                    f"`sample_weights` 需要是一维、长度为 {batch_size} 的张量"
+                )
+            weight_sum = sample_weights.sum()
+            if weight_sum.item() <= 0:
+                return torch.zeros((), device=device, dtype=loss.dtype)
+
+            # 🔧 修复：先计算每个样本在两个view上的平均损失，再加权平均
+            # loss shape: (anchor_count, batch_size)，通常 (2, batch_size)
+            sample_loss = loss.mean(dim=0)  # (batch_size,)
+
+            # 加权平均（权重上界保持为1，不会放大损失）
+            weighted_loss = (sample_loss * sample_weights).sum() / weight_sum
+
+            return weighted_loss
+
+        loss = loss.mean()
 
         return loss
 
