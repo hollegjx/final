@@ -701,8 +701,8 @@ def main() -> None:
                         help='KNN 图的最大 k 值上界（默认21，半开区间）。')
     parser.add_argument('--density_min', type=int, default=40,
                         help='密度阈值的最小百分位（默认40）。')
-    parser.add_argument('--density_max', type=int, default=100,
-                        help='密度阈值的最大百分位（默认100，不含）。')
+    parser.add_argument('--density_max', type=int, default=95,
+                        help='密度阈值的最大百分位（默认95，半开区间）。实际搜索范围：[40, 90]。')
     parser.add_argument('--density_step', type=int, default=5,
                         help='密度阈值步长（默认5）。')
     parser.add_argument('--co_mode', type=int, default=2, choices=[1, 2, 3],

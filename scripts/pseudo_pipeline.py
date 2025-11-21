@@ -128,6 +128,7 @@ def run_stage3(args, ckpt_path: Path, pseudo_path: Path, log_dir: Path,
         "--pseudo_labels_path", str(pseudo_path),
         "--pseudo_weight_mode", args.pseudo_weight_mode,
         "--pseudo_loss_weight", str(args.pseudo_loss_weight),
+        "--pseudo_for_labeled_mode", args.pseudo_for_labeled_mode,
         "--warmup_epochs", str(args.stage1_epochs),  # 🆕 使用 stage1_epochs 作为 warmup_epochs
         "--reuse_log_dir", str(log_dir),
         "--epochs", str(args.total_epochs),
@@ -193,6 +194,9 @@ def main():
                         help="阶段3训练使用的伪标签加权模式")
     parser.add_argument("--pseudo_loss_weight", type=float, default=1.0,
                         help="伪标签损失的整体权重系数 λ，最终权重 = γ × λ（默认: 1.0）")
+    parser.add_argument("--pseudo_for_labeled_mode", type=str, default="off",
+                        choices=["off", "all"],
+                        help="伪标签损失的样本范围：off=仅未标注样本（默认），all=已标注与未标注一起参与")
 
     # 🆕 训练超参数配置
     parser.add_argument("--lr", type=float, default=0.1,
@@ -257,7 +261,7 @@ def main():
             print(f"   ↪ 复用已有伪标签: {pseudo_path.name}")
         else:
             # 缺少伪标签，使用当前 checkpoint 重新聚类
-            print(f"   ⚠️  缺少伪标签，使用 {ckpt_path.name} 重新聚类")
+            print(f"   ↪ 未找到该 epoch 的伪标签，使用 {ckpt_path.name} 生成新的伪标签")
             pseudo_path = run_stage2(args, ckpt_path, run_dir)
 
         # 计算下一个训练终点

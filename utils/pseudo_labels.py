@@ -87,6 +87,7 @@ class PseudoLabelCache:
     dense_core_mask: np.ndarray
     present_mask: np.ndarray
     dense_weights: Optional[np.ndarray] = None
+    dense_weights_inverse: Optional[np.ndarray] = None
     path: Optional[str] = None
 
     @classmethod
@@ -102,6 +103,7 @@ class PseudoLabelCache:
         dense_core_mask = np.zeros(max_index + 1, dtype=bool)
         present_mask = np.zeros(max_index + 1, dtype=bool)
         dense_weights = np.zeros(max_index + 1, dtype=np.float32)
+        dense_weights_inverse = np.zeros(max_index + 1, dtype=np.float32)
 
         indices = packet.indices.astype(np.int64)
         dense_labels[indices] = packet.labels
@@ -109,9 +111,12 @@ class PseudoLabelCache:
         present_mask[indices] = True
         if packet.densities is not None:
             weights = _compute_density_weights(packet.densities)
+            inverse_weights = _compute_inverse_density_weights(packet.densities)
             dense_weights[indices] = weights.astype(np.float32)
+            dense_weights_inverse[indices] = inverse_weights.astype(np.float32)
         else:
             dense_weights[indices] = 1.0
+            dense_weights_inverse[indices] = 1.0
 
         return cls(
             packet=packet,
@@ -119,6 +124,7 @@ class PseudoLabelCache:
             dense_core_mask=dense_core_mask,
             present_mask=present_mask,
             dense_weights=dense_weights,
+            dense_weights_inverse=dense_weights_inverse,
             path=path,
         )
 
@@ -192,15 +198,23 @@ class PseudoLabelCache:
         result[valid] = self.dense_core_mask[idx[valid]]
         return result
 
-    def lookup_weights(self, indices: np.ndarray) -> np.ndarray:
-        """返回给定索引的伪标签权重（缺失为0）。"""
+    def lookup_weights(self, indices: np.ndarray, mode: str = "density") -> np.ndarray:
+        """
+        返回给定索引的伪标签权重（缺失为0）。
+
+        Args:
+            indices: 样本全局索引
+            mode: "density"（默认）、"inverse_density" 或其他（退回为均匀）
+        """
         idx = np.asarray(indices, dtype=np.int64)
         result = np.zeros(idx.shape, dtype=np.float32)
         valid = ~self.missing_mask(idx)
         if not np.any(valid):
             return result
-        if self.dense_weights is None:
+        if self.dense_weights is None or mode not in {"density", "inverse_density"}:
             result[valid] = 1.0
+        elif mode == "inverse_density" and self.dense_weights_inverse is not None:
+            result[valid] = self.dense_weights_inverse[idx[valid]]
         else:
             result[valid] = self.dense_weights[idx[valid]]
         return result
@@ -270,6 +284,17 @@ def _compute_density_weights(densities: np.ndarray) -> np.ndarray:
     normalized = ranks / n
     weights = 1.0 / (1.0 + np.exp(-12.0 * (normalized - 0.5)))
     return weights.astype(np.float32)
+
+
+def _compute_inverse_density_weights(densities: np.ndarray) -> np.ndarray:
+    """
+    反向密度加权：密度低权重大，密度高权重小，仍使用 sigmoid 曲线，
+    并将权重裁剪到 [0.2, 0.8] 避免过大/过小。
+    """
+    base = _compute_density_weights(densities).astype(np.float64)
+    inverse = 1.0 - base  # 低密度→大， 高密度→小
+    clipped = np.clip(inverse, 0.2, 0.8)
+    return clipped.astype(np.float32)
 
 
 def save_pseudo_labels(

@@ -108,22 +108,32 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
     training_session.start_training(model_info)
     setattr(args, "pseudo_cache", pseudo_cache)
     pseudo_weight_mode = getattr(args, "pseudo_weight_mode", "none")
-    valid_weight_modes = {"none", "density"}
+    valid_weight_modes = {"none", "density", "inverse_density"}
     if pseudo_weight_mode not in valid_weight_modes:
         raise ValueError(f"不支持的 pseudo_weight_mode: {pseudo_weight_mode}")
+    pseudo_for_labeled_mode = getattr(args, "pseudo_for_labeled_mode", "off")
+    if pseudo_for_labeled_mode not in {"off", "all"}:
+        raise ValueError(f"不支持的 pseudo_for_labeled_mode: {pseudo_for_labeled_mode}")
     effective_weight_mode = pseudo_weight_mode
     if pseudo_cache is None:
         if pseudo_weight_mode != "none" and not is_grid_search:
             print("⚠️  未提供伪标签文件，忽略 pseudo_weight_mode 设置")
         effective_weight_mode = "none"
-    elif pseudo_weight_mode == "density" and not pseudo_cache.has_density_weights:
+    elif pseudo_weight_mode in {"density", "inverse_density"} and not pseudo_cache.has_density_weights:
         if not is_grid_search:
-            print("⚠️  伪标签文件缺少密度信息，无法按密度加权，退回均匀权重")
+            print("⚠️  伪标签文件缺少密度信息，无法按密度相关加权，退回均匀权重")
         effective_weight_mode = "none"
     args.pseudo_weight_mode_effective = effective_weight_mode
     if pseudo_cache is not None and not is_grid_search:
-        mode_desc = "按密度加权" if effective_weight_mode == "density" else "均匀权重"
+        if effective_weight_mode == "density":
+            mode_desc = "按密度加权"
+        elif effective_weight_mode == "inverse_density":
+            mode_desc = "反向密度加权"
+        else:
+            mode_desc = "均匀权重"
         print(f"   伪标签损失权重模式: {mode_desc}")
+        mode_scope = "已标注+未标注一起" if pseudo_for_labeled_mode == "all" else "仅未标注"
+        print(f"   伪标签样本范围: {mode_scope}")
 
     epoch_progress = None
     if is_grid_search and progress_parent is not None:
@@ -253,8 +263,11 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
                 else:
                     batch_indices_np = np.asarray(uq_idxs, dtype=np.int64)
                 pseudo_labels_np = pseudo_cache.lookup_labels(batch_indices_np)
-                unlabeled_mask_np = ~mask_lab_np
-                valid_mask_np = np.logical_and(pseudo_labels_np >= 0, unlabeled_mask_np)
+                valid_mask_np = pseudo_labels_np >= 0
+                if pseudo_for_labeled_mode != "all":
+                    # 仅未标注样本参与伪标签损失
+                    unlabeled_mask_np = ~mask_lab_np
+                    valid_mask_np = np.logical_and(valid_mask_np, unlabeled_mask_np)
                 if valid_mask_np.any():
                     pseudo_labels_tensor = torch.from_numpy(
                         pseudo_labels_np[valid_mask_np]
@@ -264,7 +277,9 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
                     if f1_pseudo.size(0) > 0:
                         pseudo_feats = torch.cat([f1_pseudo.unsqueeze(1), f2_pseudo.unsqueeze(1)], dim=1)
                         if args.pseudo_weight_mode_effective == 'density':
-                            weight_values = pseudo_cache.lookup_weights(batch_indices_np)[valid_mask_np]
+                            weight_values = pseudo_cache.lookup_weights(batch_indices_np, mode="density")[valid_mask_np]
+                        elif args.pseudo_weight_mode_effective == 'inverse_density':
+                            weight_values = pseudo_cache.lookup_weights(batch_indices_np, mode="inverse_density")[valid_mask_np]
                         else:
                             weight_values = np.ones(pseudo_labels_tensor.size(0), dtype=np.float32)
                         pseudo_weights_tensor = torch.from_numpy(weight_values).to(args.device)
@@ -365,6 +380,7 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         args.writer.add_scalar('Pseudo/gamma', gamma, epoch)
         args.writer.add_scalar('Pseudo/loss_weight', pseudo_loss_weight, epoch)
         args.writer.add_scalar('Pseudo/effective_weight', gamma * pseudo_loss_weight, epoch)
+        args.writer.add_scalar('Pseudo/for_labeled_mode_flag', 1.0 if pseudo_for_labeled_mode == "all" else 0.0, epoch)
         if pseudo_cache is not None:
             args.writer.add_scalar('Loss/Pseudo', pseudo_loss_record.avg, epoch)
             args.writer.add_scalar('Pseudo/samples_per_batch', pseudo_sample_record.avg, epoch)
@@ -898,10 +914,13 @@ def build_superclass_train_parser(add_help=True):
     parser.add_argument('--pseudo_labels_path', type=str, default=None,
                         help='可选：离线 SSDDBC 生成的伪标签文件(.npz)路径。提供后训练会加载伪标签进行阶段2/3实验。')
     parser.add_argument('--pseudo_weight_mode', type=str, default='none',
-                        choices=['none', 'density'],
-                        help='伪标签损失权重模式：none=均匀取权，density=按密度sigmoid加权。')
+                        choices=['none', 'density', 'inverse_density'],
+                        help='伪标签损失权重模式：none=均匀，density=高密度高权重，inverse_density=低密度高权重（权重裁剪到0.2-0.8）。')
     parser.add_argument('--pseudo_loss_weight', type=float, default=1.0,
                         help='伪标签损失的整体权重系数，最终权重 = γ * pseudo_loss_weight（默认: 1.0）')
+    parser.add_argument('--pseudo_for_labeled_mode', type=str, default='off',
+                        choices=['off', 'all'],
+                        help="伪标签损失的样本范围：off=仅未标注样本，all=已标注+未标注一起使用")
     parser.add_argument('--warmup_epochs', type=int, default=50,
                         help='伪标签权重预热轮数，epoch < warmup_epochs 时 γ=0（默认: 50）')
     parser.add_argument('--reuse_log_dir', type=str, default=None,
