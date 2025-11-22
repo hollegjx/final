@@ -31,6 +31,7 @@ from tqdm import tqdm
 
 from ssddbc.ssddbc.adaptive_clustering import adaptive_density_clustering
 from ssddbc.evaluation.loss_function import compute_total_loss
+from project_utils.cluster_utils import cluster_acc
 
 
 @dataclass
@@ -43,9 +44,10 @@ class ClusteringSearchResult:
     loss: float  # 实际是评分函数值，越大越好
     n_clusters: int
     densities: Optional[np.ndarray] = None
+    results_grid: Optional[Dict[Tuple[int, int], Dict[str, float]]] = None  # 调试用：完整网格评分/ACC
 
 
-def _to_numpy_1d(x: Sequence[int] | np.ndarray) -> np.ndarray:
+def _to_numpy_1d(x: Union[Sequence[int], np.ndarray]) -> np.ndarray:
     arr = np.asarray(x)
     if arr.ndim != 1:
         raise ValueError(f"期望一维数组，收到形状: {arr.shape}")
@@ -61,7 +63,11 @@ def _worker_evaluate_config(
     labeled_mask: np.ndarray,
     random_state: int,
     silent: bool,
-) -> Tuple[float, int, int, np.ndarray, int, Sequence[int], Sequence[set[int]]]:
+    return_metrics: bool = False,
+) -> Union[
+    Tuple[float, int, int, np.ndarray, int, Sequence[int], Sequence[set[int]]],
+    Tuple[float, int, int, np.ndarray, int, Sequence[int], Sequence[set[int]], Dict[str, float]],
+]:
     """
     顶层 worker 函数：评估单个 (k, density_percentile) 配置
 
@@ -102,6 +108,21 @@ def _worker_evaluate_config(
 
     total_loss = loss_dict['total_loss']
 
+    if return_metrics:
+        all_acc, old_acc, new_acc = _compute_accs(predictions, targets, known_mask)
+        metrics = {
+            "score": float(total_loss),
+            "all_acc": all_acc,
+            "old_acc": old_acc,
+            "new_acc": new_acc,
+            "n_clusters": int(n_clusters),
+            "l1_loss": float(loss_dict.get("l1_loss", np.nan)),
+            "separation_score": float(loss_dict.get("separation_score", np.nan)),
+            "silhouette": float(loss_dict.get("silhouette", np.nan)),
+            "penalty_score": float(loss_dict.get("penalty_score", np.nan)),
+        }
+        return (total_loss, k, dp, predictions, n_clusters, unknown_clusters, core_clusters, metrics)
+
     return (total_loss, k, dp, predictions, n_clusters, unknown_clusters, core_clusters)
 
 
@@ -116,6 +137,7 @@ def run_clustering_search_on_features(
     random_state: int = 0,
     silent: bool = True,
     max_workers: Optional[int] = None,
+    return_all: bool = False,
 ) -> ClusteringSearchResult:
     """
     在内存特征上执行 SS-DDBC 网格搜索（不涉及磁盘 I/O）
@@ -134,6 +156,7 @@ def run_clustering_search_on_features(
         random_state: 随机种子
         silent: 是否静默模式
         max_workers: 最大并行工作进程数。None 表示使用 CPU 核心数，1 表示单进程模式
+        return_all: 调试开关，True 时返回完整网格评分和 ACC
 
     Returns:
         ClusteringSearchResult
@@ -173,6 +196,7 @@ def run_clustering_search_on_features(
     best_score = float('-inf')  # 找最大分数（因为L2组件是maximize）
     best_result: Optional[Tuple[np.ndarray, int, Sequence[int], Sequence[set[int]]]] = None
     best_params: Dict[str, int] = {}
+    results_dict: Dict[Tuple[int, int], Dict[str, float]] = {} if return_all else None
 
     # 创建进度条（始终显示，即使在 silent 模式下）
     pbar = tqdm(
@@ -218,6 +242,20 @@ def run_clustering_search_on_features(
 
             total_loss = loss_dict['total_loss']
 
+            if return_all and results_dict is not None:
+                all_acc, old_acc, new_acc = _compute_accs(predictions, targets_np, known_mask_np)
+                results_dict[(k, dp)] = {
+                    "score": float(total_loss),
+                    "all_acc": all_acc,
+                    "old_acc": old_acc,
+                    "new_acc": new_acc,
+                    "n_clusters": int(n_clusters),
+                    "l1_loss": float(loss_dict.get("l1_loss", np.nan)),
+                    "separation_score": float(loss_dict.get("separation_score", np.nan)),
+                    "silhouette": float(loss_dict.get("silhouette", np.nan)),
+                    "penalty_score": float(loss_dict.get("penalty_score", np.nan)),
+                }
+
             if total_loss > best_score:
                 best_score = total_loss
                 best_result = (predictions, n_clusters, unknown_clusters, core_clusters)
@@ -234,19 +272,28 @@ def run_clustering_search_on_features(
             future_to_params = {
                 executor.submit(
                     _worker_evaluate_config,
-                    k, dp, X, targets_np, known_mask_np, labeled_mask_np, random_state, silent,
+                    k, dp, X, targets_np, known_mask_np, labeled_mask_np, random_state, silent, return_all,
                 ): (k, dp)
                 for k, dp in configs
             }
 
             # 收集结果并找到最佳配置（最大分数）
             for future in as_completed(future_to_params):
-                total_loss, k, dp, predictions, n_clusters, unknown_clusters, core_clusters = future.result()
+                result = future.result()
+                if return_all:
+                    (total_loss, k, dp, predictions, n_clusters,
+                     unknown_clusters, core_clusters, metrics) = result
+                else:
+                    (total_loss, k, dp, predictions, n_clusters,
+                     unknown_clusters, core_clusters) = result
 
                 if total_loss > best_score:
                     best_score = total_loss
                     best_result = (predictions, n_clusters, unknown_clusters, core_clusters)
                     best_params = {"k": k, "density_percentile": dp}
+
+                if return_all and results_dict is not None:
+                    results_dict[(k, dp)] = metrics
 
                 # 更新进度条
                 pbar.update(1)
@@ -288,6 +335,7 @@ def run_clustering_search_on_features(
         loss=float(best_score),
         n_clusters=int(n_clusters),
         densities=densities,
+        results_grid=results_dict,
     )
 
 
@@ -341,3 +389,20 @@ def _run_single_configuration(
         return predictions, n_clusters, unknown_clusters, core_clusters, densities
 
     return predictions, n_clusters, unknown_clusters, core_clusters
+
+
+def _compute_accs(
+    predictions: np.ndarray,
+    targets: np.ndarray,
+    known_mask: np.ndarray
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """计算 all/old/new ACC（仅调试用）。"""
+    all_acc = float(cluster_acc(targets, predictions)) if targets.size > 0 else None
+    old_acc = None
+    new_acc = None
+    if known_mask.any():
+        old_acc = float(cluster_acc(targets[known_mask], predictions[known_mask]))
+    unknown_mask = ~known_mask
+    if unknown_mask.any():
+        new_acc = float(cluster_acc(targets[unknown_mask], predictions[unknown_mask]))
+    return all_acc, old_acc, new_acc

@@ -34,12 +34,13 @@
     - `--reuse_log_dir`：复用既有TensorBoard日志目录，便于多阶段训练拼接曲线。
   - **伪标签训练**：
     - `--pseudo_labels_path`：离线SSDDBC生成的伪标签文件(.npz)路径。
+    - `--pseudo_for_labeled_mode`：伪标签样本范围（off=仅未标注，all=已标注+未标注）。
   - **阶段控制**：
     - `--stop_at_epoch`：在指定epoch后提前停止训练。
     - `--save_features_and_exit`：在stop_at_epoch停止时自动触发特征缓存。
 - **特性**：
   - 使用 `BestModelTracker` 通过 JSON 文件持久化全局最佳模型信息。
-  - 伪标签权重调度：γ(epoch) 在 warmup_epochs 后线性上升到 1.0。
+  - 伪标签权重调度：默认 warmup 后线性上升，若提供 `update_interval`，在前两个聚类间隔内升至 1.0。
   - 支持网格搜索模式（`is_grid_search=True`时静默输出）。
 - **Help**：`python scripts/train_superclass.py --help`
 
@@ -93,6 +94,9 @@
     - `--density_min` / `--density_max` / `--density_step`：密度百分位搜索范围（默认 40-100，步长 5）。
     - `--max_workers`：并行进程数上限（默认使用 CPU 一半核心）。
     - `--pseudo_output_dir`：伪标签输出目录（默认为 `feature_cache_dir/<superclass_name>/pseudo_labels`）。
+  - **调试（可选）**：
+    - `--debug_cluster_heatmap`：为每次网格搜索输出调试热力图与 `results_grid.json`（背景 all/old/new/n_clusters，标注 score），默认写入 `run_dir/debug/epoch_xxx/`。
+    - `--current_epoch` / `--debug_root`：由 pipeline 传入，用于命名与归档调试输出。
 - **输出**：
   - 伪标签文件：`<superclass_name>_<ckpt_base>_k<k>_dp<density_percentile>.npz`
   - 包含：labels、core_mask、best_params、metadata（Score、核心点数等）。
@@ -133,12 +137,16 @@
     - `--runs_root`：Pipeline 运行目录根路径（默认 `runs_pipeline`）。
     - `--resume_run_dir`：从已有任务目录恢复（支持断点续训）。
   - **伪标签配置**：
-    - `--pseudo_weight_mode`：伪标签加权模式（choices=["none", "density"]，默认 "none"）。
-- **输出结构**（保存在 `{runs_root}/{superclass_name}/{timestamp}/`）：
-  - `log/`：TensorBoard 日志（所有阶段共用）。
-  - `checkpoints/{superclass_name}/`：训练检查点（`ckpt_epoch_XXX.pt`）。
-  - `pseudo_labels/`：伪标签文件（`*.npz`）。
-  - `best_model.json`：全局最佳模型追踪信息。
+    - `--pseudo_weight_mode`：伪标签加权模式（choices=["none", "density", "inverse_density"]，默认 "none"）。
+    - `--pseudo_for_labeled_mode`：伪标签样本范围（off=仅未标注，all=已标注+未标注）。
+    - `--pseudo_loss_weight`：伪标签损失权重系数。
+    - `--debug_cluster_heatmap`：调试开关，输出调试热力图与 `results_grid.json` 至 `run_dir/debug/epoch_xxx`（仅调试用途）。
+  - **输出结构**（保存在 `{runs_root}/{superclass_name}/{timestamp}/`）：
+    - `log/`：TensorBoard 日志（所有阶段共用）。
+    - `checkpoints/{superclass_name}/`：训练检查点（`ckpt_epoch_XXX.pt`）。
+    - `pseudo_labels/`：伪标签文件（`*.npz`）。
+    - `debug/epoch_xxx/`：调试热力图与 `results_grid.json`（开启 `--debug_cluster_heatmap` 时生成）。
+    - `best_model.json`：全局最佳模型追踪信息。
 - **使用示例**：
   ```bash
   # 完整训练（预热50轮 → 每5轮更新伪标签 → 总共200轮）

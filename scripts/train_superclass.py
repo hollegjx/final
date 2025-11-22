@@ -55,16 +55,29 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 
-def get_gamma(epoch: int, warmup_epochs: int = 50, total_epochs: int = 200) -> float:
+from typing import Optional
+
+
+def get_gamma(epoch: int, warmup_epochs: int = 50, total_epochs: int = 200,
+              update_interval: Optional[int] = None, ramp_intervals: int = 2) -> float:
     """
-    伪标签权重调度函数 γ(epoch)，对应 TODO.md 中的线性调度策略。
+    伪标签权重调度函数 γ(epoch)。
 
     - epoch < warmup_epochs: γ = 0.0
-    - warmup_epochs <= epoch <= total_epochs: γ 从 0.0 线性上升到 1.0
-    - epoch > total_epochs: γ 固定为 1.0
+    - 若提供 update_interval，则在 warmup 后的前 ramp_intervals 个伪标签更新间隔内线性升至 1.0，
+      之后保持 1.0（默认在前两个间隔内完成增长）。
+    - 若未提供 update_interval，则退回原有的线性调度：warmup→total_epochs 期间升至 1.0。
     """
     if epoch < warmup_epochs:
         return 0.0
+
+    if update_interval is not None and update_interval > 0 and ramp_intervals > 0:
+        ramp_total = max(ramp_intervals * update_interval, 1)
+        progress = (epoch - warmup_epochs + 1) / ramp_total
+        progress = max(0.0, min(1.0, progress))
+        return float(progress)
+
+    # 兼容老的线性策略
     remaining_epochs = max(total_epochs - warmup_epochs, 1)
     progress = (epoch - warmup_epochs) / remaining_epochs
     progress = max(0.0, min(1.0, progress))
@@ -290,7 +303,13 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
                         )
                         pseudo_sample_count = int(pseudo_labels_tensor.size(0))
 
-            gamma = get_gamma(epoch, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
+            gamma = get_gamma(
+                epoch,
+                warmup_epochs=args.warmup_epochs,
+                total_epochs=args.epochs,
+                update_interval=getattr(args, "update_interval", None),
+                ramp_intervals=2,
+            )
 
             # 总损失 = 无监督对比损失 + 监督对比损失 + γ·pseudo_loss_weight·伪标签损失
             loss = epoch_contrastive_weight * contrastive_loss + epoch_sup_con_weight * sup_con_loss
@@ -375,7 +394,13 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
         args.writer.add_scalar('LR', get_mean_lr(optimizer), epoch)
 
         # 2) 计算并记录当前 epoch 的 γ（伪标签损失权重）
-        gamma = get_gamma(epoch, warmup_epochs=args.warmup_epochs, total_epochs=args.epochs)
+        gamma = get_gamma(
+            epoch,
+            warmup_epochs=args.warmup_epochs,
+            total_epochs=args.epochs,
+            update_interval=getattr(args, "update_interval", None),
+            ramp_intervals=2,
+        )
         pseudo_loss_weight = getattr(args, 'pseudo_loss_weight', 1.0)
         args.writer.add_scalar('Pseudo/gamma', gamma, epoch)
         args.writer.add_scalar('Pseudo/loss_weight', pseudo_loss_weight, epoch)
@@ -931,6 +956,8 @@ def build_superclass_train_parser(add_help=True):
                         help='可选：在 stop_at_epoch 停止时自动触发特征缓存脚本。')
     parser.add_argument('--feature_cache_dir', type=str, default=None,
                         help='可选：特征缓存目录。未指定时使用 config.py 中的默认值。')
+    parser.add_argument('--update_interval', type=int, default=None,
+                        help='伪标签更新间隔（用于 γ 在前两个间隔内完成上升；未指定则使用线性调度）')
 
     # =====================================================================
     # 对比学习框架参数

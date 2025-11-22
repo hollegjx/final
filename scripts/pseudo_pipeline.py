@@ -73,10 +73,11 @@ def run_stage1(args, run_dir: Path):
     return latest_ckpt, log_dir
 
 
-def run_stage2(args, ckpt_path: Path, run_dir: Path):
+def run_stage2(args, ckpt_path: Path, run_dir: Path, current_epoch: int):
     pseudo_dir = run_dir / "pseudo_labels"
     features_dir = run_dir / "features"
     pseudo_dir.mkdir(exist_ok=True)
+    debug_dir = run_dir / "debug"
     cmd = [
         PYTHON_EXEC,
         "scripts/offline_ssddbc_superclass.py",
@@ -85,7 +86,11 @@ def run_stage2(args, ckpt_path: Path, run_dir: Path):
         "--feature_cache_dir", str(features_dir),
         "--pseudo_output_dir", str(pseudo_dir),
         "--skip_feature_extraction",  # 🆕 跳过特征提取，直接使用缓存
+        "--current_epoch", str(current_epoch),
+        "--debug_root", str(debug_dir),
     ]
+    if getattr(args, "debug_cluster_heatmap", False):
+        cmd.append("--debug_cluster_heatmap")
     _run(cmd)
     npz_files = sorted(pseudo_dir.glob("*.npz"))
     if not npz_files:
@@ -190,13 +195,15 @@ def main():
     parser.add_argument("--resume_run_dir", type=str, default=None,
                         help="从已有任务目录恢复（支持断点续训）")
     parser.add_argument("--pseudo_weight_mode", type=str, default="none",
-                        choices=["none", "density"],
+                        choices=["none", "density", "inverse_density"],
                         help="阶段3训练使用的伪标签加权模式")
     parser.add_argument("--pseudo_loss_weight", type=float, default=1.0,
                         help="伪标签损失的整体权重系数 λ，最终权重 = γ × λ（默认: 1.0）")
     parser.add_argument("--pseudo_for_labeled_mode", type=str, default="off",
                         choices=["off", "all"],
                         help="伪标签损失的样本范围：off=仅未标注样本（默认），all=已标注与未标注一起参与")
+    parser.add_argument("--debug_cluster_heatmap", action="store_true",
+                        help="调试：Stage2 网格搜索输出 ACC/score 热力图和 results_grid.json（存于 run_dir/debug/epoch_xxx）")
 
     # 🆕 训练超参数配置
     parser.add_argument("--lr", type=float, default=0.1,
@@ -262,7 +269,7 @@ def main():
         else:
             # 缺少伪标签，使用当前 checkpoint 重新聚类
             print(f"   ↪ 未找到该 epoch 的伪标签，使用 {ckpt_path.name} 生成新的伪标签")
-            pseudo_path = run_stage2(args, ckpt_path, run_dir)
+            pseudo_path = run_stage2(args, ckpt_path, run_dir, current_epoch)
 
         # 计算下一个训练终点
         next_epoch = min(current_epoch + args.update_interval, args.total_epochs)

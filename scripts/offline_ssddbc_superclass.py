@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 from datetime import datetime
+import re
 from typing import Dict, Any
 
 import numpy as np
@@ -132,6 +133,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过特征提取阶段，直接使用已有缓存（适用于 pipeline 场景）。",
     )
+    parser.add_argument(
+        "--debug_cluster_heatmap",
+        action="store_true",
+        help="调试选项：为每次网格搜索生成 ACC/score 热力图（背景=all/old/new/n_clusters，标注=score）。",
+    )
+    parser.add_argument(
+        "--current_epoch",
+        type=int,
+        default=None,
+        help="（可选）当前聚类对应的 epoch，用于热力图命名（调试）。",
+    )
+    parser.add_argument(
+        "--debug_root",
+        type=str,
+        default=None,
+        help="（可选）调试输出根目录（由 pipeline 传入）。",
+    )
+    parser.add_argument(
+        "--exp_root",
+        type=str,
+        default=None,
+        help="（可选）运行根目录（便于定位调试输出）。",
+    )
 
     return parser
 
@@ -229,6 +253,7 @@ def run_offline_clustering(args: argparse.Namespace) -> str:
         random_state=0,
         silent=True,
         max_workers=args.max_workers,
+        return_all=getattr(args, "debug_cluster_heatmap", False),
     )
 
     core_mask = np.zeros_like(indices, dtype=bool)
@@ -260,6 +285,45 @@ def run_offline_clustering(args: argparse.Namespace) -> str:
         metadata=metadata,
         densities=search_result.densities,
     )
+
+    # 调试：为每次聚类保存热力图（背景=all/old/new/n_clusters，标注=score）
+    if getattr(args, "debug_cluster_heatmap", False):
+        results_grid = getattr(search_result, "results_grid", None)
+        if results_grid:
+            from ssddbc.grid_search.heatmap import create_mixed_heatmap
+            epoch_tag = args.current_epoch if args.current_epoch is not None else "unknown"
+            # 调试输出基于 run_dir/debug/epoch_xxx
+            if args.debug_root:
+                debug_base = args.debug_root
+            else:
+                # fallback：pseudo_output_dir 的上一级，避免污染伪标签目录
+                debug_base = os.path.normpath(os.path.join(args.pseudo_output_dir or pseudo_dir, os.pardir, "debug"))
+            heatmap_dir = os.path.join(debug_base, f"epoch_{epoch_tag}")
+            os.makedirs(heatmap_dir, exist_ok=True)
+            print(f"🎨 调试: 生成热力图到 {heatmap_dir}（仅调试用途，非论文指标）")
+            for color_metric in ["all_acc", "old_acc", "new_acc", "n_clusters"]:
+                create_mixed_heatmap(
+                    results_dict=results_grid,
+                    color_metric=color_metric,
+                    display_metric="score",
+                    superclass_name=args.superclass_name,
+                    output_dir=heatmap_dir,
+                    save_plots=True,
+                )
+            # 保存完整网格结果，包含各损失分量与ACC，便于对标 batch_runner
+            import json
+            grid_path = os.path.join(heatmap_dir, "results_grid.json")
+            with open(grid_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        f"k{k}_dp{dp}": metrics
+                        for (k, dp), metrics in sorted(results_grid.items())
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2
+                )
+            print(f"📁 热力图已保存（{len(results_grid)} 个配置，调试用途）")
 
     print(
         f"✅ 伪标签已保存: {pseudo_path}\n"
