@@ -12,8 +12,8 @@
 - 固定使用已裁剪配置：
   dense_method=1, co_mode=2, assign_model=3,
   cluster_distance_method='prototype'
-- 使用损失函数（L1 + L2）作为评分标准，权重：
-  * l1_weight=1.0
+- 使用损失函数（L1 + L2）作为评分标准，硬编码权重（L1 为最小化项，取负）：
+  * l1_weight=-1.0
   * separation_weight=0.0
   * silhouette_weight=3.0
 - 并行模式：max_workers 控制进程数，1 为单进程，None 为自动检测 CPU 核心数
@@ -32,6 +32,14 @@ from tqdm import tqdm
 from ssddbc.ssddbc.adaptive_clustering import adaptive_density_clustering
 from ssddbc.evaluation.loss_function import compute_total_loss
 from project_utils.cluster_utils import cluster_acc
+
+# 硬编码的损失权重：L1=-1.0（最小化），Silhouette=3.0，分离度权重置0（仅保留指标输出）
+L1_WEIGHT = -1.0
+L1_TYPE = "cross_entropy"
+L2_WEIGHT = 1.0
+SEPARATION_WEIGHT = 0.0
+L2_COMPONENTS = ["separation", "silhouette"]
+L2_COMPONENT_WEIGHTS = {"silhouette": 3.0, "separation": 0.0}
 
 
 @dataclass
@@ -94,12 +102,12 @@ def _worker_evaluate_config(
         predictions=predictions,
         targets=targets,
         labeled_mask=labeled_mask,
-        l1_weight=1.0,
-        l2_weight=1.0,
-        l1_type='cross_entropy',
-        l2_components=['separation', 'silhouette'],
-        l2_component_weights={'silhouette': 3.0},
-        separation_weight=0.0,
+        l1_weight=L1_WEIGHT,
+        l2_weight=L2_WEIGHT,
+        l1_type=L1_TYPE,
+        l2_components=L2_COMPONENTS,
+        l2_component_weights=L2_COMPONENT_WEIGHTS,
+        separation_weight=SEPARATION_WEIGHT,
         clusters=core_clusters,
         k=k,
         cluster_distance_method='prototype',
@@ -110,16 +118,47 @@ def _worker_evaluate_config(
 
     if return_metrics:
         all_acc, old_acc, new_acc = _compute_accs(predictions, targets, known_mask)
+
+        # 提取损失分量，与单进程模式保持一致
+        l1_metrics = loss_dict.get("l1_metrics", {}) or {}
+        l2_metrics = loss_dict.get("l2_metrics", {}) or {}
+        components = l2_metrics.get("components", {}) or {}
+
+        # 提取L2组件值
+        sep = None
+        pen = None
+        if "cluster_quality" in l2_metrics:
+            cq = l2_metrics.get("cluster_quality") or {}
+            sep = cq.get("separation_score")
+            pen = cq.get("penalty_score")
+        if sep is None:
+            sep = components.get("separation", {}).get("value")
+        if pen is None:
+            pen = components.get("penalty", {}).get("value")
+        sil = components.get("silhouette", {}).get("value")
+        l1_val = l1_metrics.get("cross_entropy") or l1_metrics.get("loss") or l1_metrics.get("l1")
+
+        # 安全转换：None或NaN都转为0.0
+        def safe_float(val, default=0.0):
+            """将值安全转换为float，None或NaN转为default"""
+            if val is None:
+                return default
+            try:
+                f = float(val)
+                return default if np.isnan(f) else f
+            except (TypeError, ValueError):
+                return default
+
         metrics = {
             "score": float(total_loss),
             "all_acc": all_acc,
             "old_acc": old_acc,
             "new_acc": new_acc,
             "n_clusters": int(n_clusters),
-            "l1_loss": float(loss_dict.get("l1_loss", np.nan)),
-            "separation_score": float(loss_dict.get("separation_score", np.nan)),
-            "silhouette": float(loss_dict.get("silhouette", np.nan)),
-            "penalty_score": float(loss_dict.get("penalty_score", np.nan)),
+            "l1_loss": safe_float(l1_val, 0.0),
+            "separation_score": safe_float(sep, 0.0),
+            "silhouette": safe_float(sil, 0.0),
+            "penalty_score": safe_float(pen, 0.0),
         }
         return (total_loss, k, dp, predictions, n_clusters, unknown_clusters, core_clusters, metrics)
 
@@ -144,7 +183,7 @@ def run_clustering_search_on_features(
 
     使用损失函数（L1 + L2）评价参数组合，选择最大分数的配置。
     注：由于L2包含maximize组件，实际是找最大值而非最小损失。
-    权重配置：l1_weight=1.0, separation_weight=0.0, silhouette_weight=3.0
+    权重配置（硬编码）：l1_weight=-1.0, separation_weight=0.0, silhouette_weight=3.0
 
     Args:
         features: 特征矩阵 (n_samples, feat_dim)
@@ -228,12 +267,12 @@ def run_clustering_search_on_features(
                 predictions=predictions,
                 targets=targets_np,
                 labeled_mask=labeled_mask_np,
-                l1_weight=1.0,
-                l2_weight=1.0,
-                l1_type='cross_entropy',
-                l2_components=['separation', 'silhouette'],
-                l2_component_weights={'silhouette': 3.0},
-                separation_weight=0.0,
+                l1_weight=L1_WEIGHT,
+                l2_weight=L2_WEIGHT,
+                l1_type=L1_TYPE,
+                l2_components=L2_COMPONENTS,
+                l2_component_weights=L2_COMPONENT_WEIGHTS,
+                separation_weight=SEPARATION_WEIGHT,
                 clusters=core_clusters,
                 k=k,
                 cluster_distance_method='prototype',
@@ -244,16 +283,47 @@ def run_clustering_search_on_features(
 
             if return_all and results_dict is not None:
                 all_acc, old_acc, new_acc = _compute_accs(predictions, targets_np, known_mask_np)
+                l1_metrics = loss_dict.get("l1_metrics", {}) or {}
+                l2_metrics = loss_dict.get("l2_metrics", {}) or {}
+                components = l2_metrics.get("components", {}) or {}
+
+                # 提取L2组件值，默认为0.0（避免NaN）
+                sep = None
+                pen = None
+                if "cluster_quality" in l2_metrics:
+                    cq = l2_metrics.get("cluster_quality") or {}
+                    sep = cq.get("separation_score")
+                    pen = cq.get("penalty_score")
+                if sep is None:
+                    sep = components.get("separation", {}).get("value")
+                if pen is None:
+                    pen = components.get("penalty", {}).get("value")
+                sil = components.get("silhouette", {}).get("value")
+
+                # 提取L1值，默认为0.0
+                l1_val = l1_metrics.get("cross_entropy") or l1_metrics.get("loss") or l1_metrics.get("l1")
+
+                # 安全转换：None或NaN都转为0.0
+                def safe_float(val, default=0.0):
+                    """将值安全转换为float，None或NaN转为default"""
+                    if val is None:
+                        return default
+                    try:
+                        f = float(val)
+                        return default if np.isnan(f) else f
+                    except (TypeError, ValueError):
+                        return default
+
                 results_dict[(k, dp)] = {
                     "score": float(total_loss),
                     "all_acc": all_acc,
                     "old_acc": old_acc,
                     "new_acc": new_acc,
                     "n_clusters": int(n_clusters),
-                    "l1_loss": float(loss_dict.get("l1_loss", np.nan)),
-                    "separation_score": float(loss_dict.get("separation_score", np.nan)),
-                    "silhouette": float(loss_dict.get("silhouette", np.nan)),
-                    "penalty_score": float(loss_dict.get("penalty_score", np.nan)),
+                    "l1_loss": safe_float(l1_val, 0.0),
+                    "separation_score": safe_float(sep, 0.0),
+                    "silhouette": safe_float(sil, 0.0),
+                    "penalty_score": safe_float(pen, 0.0),
                 }
 
             if total_loss > best_score:

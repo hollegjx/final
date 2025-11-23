@@ -410,7 +410,7 @@ def train_superclass(projection_head, model, train_loader, test_loader, unlabell
             args.writer.add_scalar('Loss/Pseudo', pseudo_loss_record.avg, epoch)
             args.writer.add_scalar('Pseudo/samples_per_batch', pseudo_sample_record.avg, epoch)
         if not is_grid_search:
-            print(f"   伪标签权重 γ(epoch={epoch}) = {gamma:.4f}, λ = {pseudo_loss_weight:.2f}, 有效权重 = {gamma * pseudo_loss_weight:.4f}")
+            print(f"   伪标签权重 γ(epoch={epoch+1}) = {gamma:.4f}, λ = {pseudo_loss_weight:.2f}, 有效权重 = {gamma * pseudo_loss_weight:.4f}")
 
         # 3) 伪标签刷新钩子（已由离线 Stage2 取代，避免在训练内部重复聚类）
 

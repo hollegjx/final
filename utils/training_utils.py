@@ -50,7 +50,7 @@ class EarlyStoppingMonitor:
             self.best_epoch = current_epoch
             self.counter = 0
             if self.verbose:
-                print(f"🎯 {self.metric_name}新最佳: {current_metric:.4f} (第{current_epoch}轮)")
+                print(f"🎯 {self.metric_name}新最佳: {current_metric:.4f} (第{current_epoch + 1}轮)")
         else:
             self.counter += 1
             if self.verbose:
@@ -191,7 +191,7 @@ def print_performance_summary(
     print(f"├─ Old ACC差距: {performance_gap['old_acc_gap']:+.4f}")
     print(f"└─ New ACC差距: {performance_gap['new_acc_gap']:+.4f}")
 
-    print(f"\n🏆 历史最佳 (第{best_performance['best_epoch']}轮):")
+    print(f"\n🏆 历史最佳 (第{best_performance['best_epoch'] + 1}轮):")
     print(f"├─ Best All ACC: {best_performance['best_all_acc']:.4f}")
     print(f"├─ Best Old ACC: {best_performance['best_old_acc']:.4f}")
     print(f"└─ Best New ACC: {best_performance['best_new_acc']:.4f}")
@@ -230,12 +230,12 @@ def print_training_complete_info(
     print("\n" + "🎉" * 20 + " 训练完成 " + "🎉" * 20)
 
     if early_stopped:
-        print(f"🛑 早停于第{stopped_epoch}轮 (总计划{total_epochs}轮)")
+        print(f"🛑 早停于第{stopped_epoch + 1}轮 (总计划{total_epochs}轮)")
     else:
         print(f"✅ 完成全部{total_epochs}轮训练")
 
     print(f"⏱️  总用时: {elapsed_time}")
-    print(f"🏆 最佳性能 (第{best_performance['best_epoch']}轮):")
+    print(f"🏆 最佳性能 (第{best_performance['best_epoch'] + 1}轮):")
     print(f"├─ Best All ACC: {best_performance['best_all_acc']:.4f}")
     print(f"├─ Best Old ACC: {best_performance['best_old_acc']:.4f}")
     print(f"└─ Best New ACC: {best_performance['best_new_acc']:.4f}")
